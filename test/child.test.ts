@@ -24,15 +24,11 @@ beforeEach(() => {
   record = runRecord();
   directory = createRunDirectory(record.parentSessionId, record.runId);
   writeRun(directory, record);
-  process.env.PI_HERDR_SUBAGENT_RUN_ID = record.runId;
-  process.env.PI_HERDR_SUBAGENT_TOKEN = record.capabilityToken;
 });
 
 afterEach(() => {
   vi.useRealTimers();
   delete process.env.PI_HERDR_SUBAGENTS_STORAGE_DIR;
-  delete process.env.PI_HERDR_SUBAGENT_RUN_ID;
-  delete process.env.PI_HERDR_SUBAGENT_TOKEN;
   fs.rmSync(root, { recursive: true, force: true });
 });
 

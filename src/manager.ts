@@ -11,7 +11,6 @@ import {
   readAck,
   readChildState,
   readResult,
-  removeAck,
   removeRunDirectory,
   writeDispatch,
   writeResult,
@@ -20,6 +19,7 @@ import {
 import { errorMessage } from "./json.js";
 import { sliceUtf8 } from "./utf8.js";
 import {
+  ACTIVE_STATUSES,
   PROTOCOL_VERSION,
   type AgentStatus,
   type AgentSummary,
@@ -27,6 +27,7 @@ import {
   type DispatchRequest,
   type HerdrAgent,
   type HerdrPane,
+  type NativeAgentStatus,
   type RunRecord,
   type RunResult,
   type ThinkingLevel,
@@ -39,7 +40,6 @@ const LEGACY_RETENTION = { deliveredDays: 7, undeliveredDays: 30 } as const;
 /** A freshly split pane reports `agent_pane_busy` until its shell reaches an interactive prompt. */
 const PANE_READY_TIMEOUT_MS = 15_000;
 const PANE_READY_RETRY_MS = 250;
-const ACTIVE_STATUSES = new Set<AgentStatus>(["starting", "working", "blocked"]);
 const MODEL_CLOSEABLE_STATUSES = new Set<AgentStatus>(["idle", "done", "failed", "interrupted", "closed"]);
 
 export type HerdrPort = Pick<
@@ -69,8 +69,10 @@ export interface ManagerHooks {
 export interface SpawnInput {
   taskName: string;
   message: string;
+  /** The already-resolved profile name, when one was selected. */
   profile?: string;
-  inherited: ModelProfile;
+  /** The fully resolved model to run the child with. */
+  model: ModelProfile;
   parentSessionFile?: string;
   signal?: AbortSignal;
 }
@@ -98,18 +100,14 @@ export interface ResponseSlice {
   next_offset?: number;
 }
 
-interface SelectedProfile {
-  profile?: string;
-  model: ModelProfile;
-}
-
 /** The environment handed to a child Pi process. Declared as an alias so it stays
- *  assignable to the Herdr client's `env` dictionary. */
+ *  assignable to the Herdr client's `env` dictionary. The capability token is
+ *  deliberately absent: it would leak through the Herdr CLI's argv, so the child
+ *  reads it from the 0600 run.json inside its private run directory instead. */
 type ChildEnvironment = {
   PI_HERDR_SUBAGENT: string;
   PI_HERDR_SUBAGENT_RUN_ID: string;
   PI_HERDR_SUBAGENT_RUN_DIR: string;
-  PI_HERDR_SUBAGENT_TOKEN: string;
   PI_HERDR_SUBAGENT_PARENT_SESSION_ID: string;
 };
 
@@ -195,7 +193,6 @@ export class AgentManager {
   async spawn(input: SpawnInput): Promise<SpawnReceipt> {
     assertTaskName(input.taskName);
     assertMessage(input.message);
-    const selected = this.selectProfile(input.profile, input.inherited);
 
     const { run, initial } = await this.withAllocationLock(async () => {
       if (input.signal?.aborted) throw new HerdrCommandError("Aborted", "aborted");
@@ -213,8 +210,8 @@ export class AgentManager {
         parentSessionId: this.parent.sessionId,
         cwd: this.parent.cwd,
         capabilityToken,
-        provider: selected.model.provider,
-        model: selected.model.model,
+        provider: input.model.provider,
+        model: input.model.model,
         herdrAgentName: agentRuntimeName(input.taskName, runId),
         status: "starting",
         deliveredResultIds: [],
@@ -223,8 +220,8 @@ export class AgentManager {
         updatedAt: now,
       };
       if (input.parentSessionFile) record.parentSessionFile = input.parentSessionFile;
-      if (selected.profile) record.profile = selected.profile;
-      if (selected.model.thinking) record.thinking = selected.model.thinking;
+      if (input.profile) record.profile = input.profile;
+      if (input.model.thinking) record.thinking = input.model.thinking;
       const managed: ManagedRun = { directory, record, stateSeq: 0 };
       this.runs.set(runId, managed);
       this.activeReservations.add(runId);
@@ -263,7 +260,9 @@ export class AgentManager {
         if (isHerdrAbort(error)) throw error;
       }
 
-      ack = await this.waitForAck(run, initial.requestId, 6_000, input.signal);
+      // A failed start already produced a runtime failure result; the child can
+      // never acknowledge, so waiting would only stall the tool call.
+      ack = run.record.status === "failed" ? undefined : await this.waitForAck(run, initial.requestId, 6_000, input.signal);
       if (ack?.state === "delivered" || ack?.state === "queued") {
         if (run.record.status === "starting" || run.record.status === "idle") this.updateRun(run, { status: "working" });
       } else if (ack?.state === "failed") {
@@ -282,11 +281,11 @@ export class AgentManager {
       tab_id: run.record.tabId,
       agent_status: run.record.status,
       accepted: ack?.state === "delivered" || ack?.state === "queued",
-      provider: selected.model.provider,
-      model: selected.model.model,
+      provider: input.model.provider,
+      model: input.model.model,
     };
-    if (selected.profile) receipt.profile = selected.profile;
-    if (selected.model.thinking) receipt.thinking = selected.model.thinking;
+    if (input.profile) receipt.profile = input.profile;
+    if (input.model.thinking) receipt.thinking = input.model.thinking;
     return receipt;
   }
 
@@ -350,7 +349,7 @@ export class AgentManager {
     } catch (error) {
       if (await this.paneExists(run.record.paneId, options.signal)) throw error;
     }
-    this.updateRun(run, { status: "closed", closedAt: Date.now(), statusMessage: undefined });
+    this.updateRun(run, { status: "closed", closedAt: Date.now(), statusMessage: undefined, pendingRequestId: undefined });
     appendEvent(run.directory, "pane.closed", { previousStatus: previous, force: options.force });
     return { previous_status: previous };
   }
@@ -444,7 +443,7 @@ export class AgentManager {
 
   purgeClosed(): number {
     let count = 0;
-    for (const run of [...this.runs.values()]) {
+    for (const run of this.runs.values()) {
       if (run.record.status !== "closed") continue;
       removeRunDirectory(run.directory);
       this.runs.delete(run.record.runId);
@@ -469,7 +468,7 @@ export class AgentManager {
           if (!isHerdrError(error, "agent_not_found", "pane_not_found")) throw error;
         }
         if (record.paneId && !(await this.paneExists(record.paneId, signal))) {
-          this.updateRun(managed, { status: "closed", closedAt: now });
+          this.updateRun(managed, { status: "closed", closedAt: now, pendingRequestId: undefined });
         }
       }
       const terminalWithoutPane = !record.paneId && (record.status === "done" || record.status === "failed" || record.status === "interrupted");
@@ -494,7 +493,15 @@ export class AgentManager {
     if (this.polling) return;
     this.polling = true;
     try {
-      for (const run of this.currentRuns()) this.pollRun(run);
+      for (const run of this.currentRuns()) {
+        try {
+          this.pollRun(run);
+        } catch (error) {
+          // A single run's storage or delivery failure must not crash the interval
+          // callback (an unhandled rejection) or starve the other runs.
+          appendEvent(run.directory, "poll.failed", { error: errorMessage(error) });
+        }
+      }
     } finally {
       this.polling = false;
     }
@@ -536,26 +543,32 @@ export class AgentManager {
     try {
       const agents = await this.herdr.listAgents();
       for (const run of this.currentRuns()) {
-        if (run.record.status === "closed" || !run.record.paneId) continue;
-        const agent = agents.find(
-          (candidate) => candidate.name === run.record.herdrAgentName || candidate.pane_id === run.record.paneId,
-        );
-        if (agent) {
-          this.syncAgentLocation(run, agent);
-          this.applyNativeStatus(run, agent.agent_status);
-          continue;
-        }
-        if (!(await this.paneExists(run.record.paneId))) {
-          if (ACTIVE_STATUSES.has(run.record.status)) this.failRun(run, "The Herdr pane closed before the task completed.");
-          this.updateRun(run, { status: "closed", closedAt: Date.now() });
-          continue;
-        }
-        if (run.record.status === "starting" && Date.now() - run.record.updatedAt > 60_000) {
-          this.failRun(run, "Pi did not become available in the owned Herdr pane.");
+        try {
+          if (run.record.status === "closed" || !run.record.paneId) continue;
+          const agent = agents.find(
+            (candidate) => candidate.name === run.record.herdrAgentName || candidate.pane_id === run.record.paneId,
+          );
+          if (agent) {
+            this.syncAgentLocation(run, agent);
+            this.applyNativeStatus(run, agent.agent_status);
+            continue;
+          }
+          if (!(await this.paneExists(run.record.paneId))) {
+            if (ACTIVE_STATUSES.has(run.record.status)) this.failRun(run, "The Herdr pane closed before the task completed.");
+            this.updateRun(run, { status: "closed", closedAt: Date.now(), pendingRequestId: undefined });
+            continue;
+          }
+          if (run.record.status === "starting" && Date.now() - run.record.updatedAt > 60_000) {
+            this.failRun(run, "Pi did not become available in the owned Herdr pane.");
+          }
+        } catch (error) {
+          // A transient Herdr failure must not change ownership or task state,
+          // but anything else is a programming error worth a trace.
+          if (!isHerdrError(error)) appendEvent(run.directory, "reconcile.failed", { error: errorMessage(error) });
         }
       }
     } catch {
-      // A transient Herdr failure must not change ownership or task state.
+      // Listing agents failed; a transient Herdr failure must not change task state.
     } finally {
       this.reconciling = false;
     }
@@ -695,7 +708,7 @@ export class AgentManager {
     }
   }
 
-  private applyNativeStatus(run: ManagedRun, status: "idle" | "working" | "blocked" | "done" | "unknown"): void {
+  private applyNativeStatus(run: ManagedRun, status: NativeAgentStatus): void {
     if (status === "unknown" || run.record.status === "closed") return;
     const resultIsAuthoritative =
       Boolean(run.record.latestResultId) &&
@@ -726,6 +739,7 @@ export class AgentManager {
       status: run.record.paneId ? "failed" : "closed",
       statusMessage: message,
       latestResultId: result.resultId,
+      pendingRequestId: undefined,
     };
     if (!run.record.paneId) patch.closedAt = Date.now();
     this.updateRun(run, patch);
@@ -748,17 +762,6 @@ export class AgentManager {
     record.updatedAt = Date.now();
     writeRun(run.directory, run.record);
     this.hooks.onChange();
-  }
-
-  private selectProfile(requested: string | undefined, inherited: ModelProfile): SelectedProfile {
-    const name = requested ?? this.config.defaultProfile;
-    if (!name) return { model: inherited };
-    const profile = this.config.profiles[name];
-    if (!profile) {
-      const available = Object.keys(this.config.profiles).join(", ") || "none";
-      throw new Error(`Unknown model profile '${name}'. Available profiles: ${available}`);
-    }
-    return { profile: name, model: profile };
   }
 
   private assertUniqueOpenName(taskName: string): void {
@@ -824,12 +827,12 @@ export class AgentManager {
   ): Promise<DispatchAck | undefined> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      if (signal?.aborted) throw new Error("Aborted");
+      if (signal?.aborted) throw new HerdrCommandError("Aborted", "aborted");
+      // Acks are left in place after reading: the child uses them to recover a
+      // crash between writing the ack and removing the dispatch, and the whole
+      // directory is retired with the run.
       const ack = readAck(run.directory, requestId, run.record.capabilityToken);
-      if (ack) {
-        removeAck(run.directory, requestId);
-        return ack;
-      }
+      if (ack) return ack;
       await delay(50);
     }
     return undefined;
@@ -854,7 +857,6 @@ function childEnvironment(run: ManagedRun): ChildEnvironment {
     PI_HERDR_SUBAGENT: "1",
     PI_HERDR_SUBAGENT_RUN_ID: run.record.runId,
     PI_HERDR_SUBAGENT_RUN_DIR: run.directory,
-    PI_HERDR_SUBAGENT_TOKEN: run.record.capabilityToken,
     PI_HERDR_SUBAGENT_PARENT_SESSION_ID: run.record.parentSessionId,
   };
 }

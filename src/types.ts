@@ -1,18 +1,25 @@
 export const PROTOCOL_VERSION = 1 as const;
 
-export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-export type AgentStatus =
-  | "starting"
-  | "working"
-  | "blocked"
-  | "done"
-  | "failed"
-  | "interrupted"
-  | "idle"
-  | "closed";
+export const AGENT_STATUSES = [
+  "starting",
+  "working",
+  "blocked",
+  "done",
+  "failed",
+  "interrupted",
+  "idle",
+  "closed",
+] as const;
+export type AgentStatus = (typeof AGENT_STATUSES)[number];
 
-export type TerminalStatus = Extract<AgentStatus, "done" | "failed" | "interrupted" | "closed">;
+/** The lifecycle states the Herdr CLI itself reports for a pane's agent. */
+export type NativeAgentStatus = "idle" | "working" | "blocked" | "done" | "unknown";
+
+/** Statuses that count against concurrency limits and mean a result is still coming. */
+export const ACTIVE_STATUSES: ReadonlySet<AgentStatus> = new Set(["starting", "working", "blocked"]);
 
 export interface ModelProfile {
   provider: string;
@@ -131,14 +138,14 @@ export interface HerdrPane {
   foreground_cwd?: string;
   label?: string;
   agent?: string;
-  agent_status: "idle" | "working" | "blocked" | "done" | "unknown";
+  agent_status: NativeAgentStatus;
 }
 
 export interface HerdrAgent {
   name?: string;
   agent?: string;
   display_agent?: string;
-  agent_status: "idle" | "working" | "blocked" | "done" | "unknown";
+  agent_status: NativeAgentStatus;
   workspace_id: string;
   tab_id: string;
   pane_id: string;
@@ -151,7 +158,7 @@ export interface HerdrTab {
   workspace_id: string;
   label: string;
   focused: boolean;
-  agent_status: "idle" | "working" | "blocked" | "done" | "unknown";
+  agent_status: NativeAgentStatus;
 }
 
 export interface PaneRect {

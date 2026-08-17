@@ -11,7 +11,7 @@ import {
   type JsonObject,
   type JsonValue,
 } from "./json.js";
-import type { ExtensionConfig, ModelProfile, ThinkingLevel } from "./types.js";
+import { THINKING_LEVELS, type ExtensionConfig, type ModelProfile, type ThinkingLevel } from "./types.js";
 
 export const DEFAULT_CONFIG: ExtensionConfig = {
   profiles: {},
@@ -147,18 +147,9 @@ function parseProfile(value: JsonValue | undefined, label: string): ModelProfile
 
 function parseThinking(value: JsonValue | undefined, label: string): ThinkingLevel | undefined {
   if (value === undefined) return undefined;
-  if (
-    value === "off" ||
-    value === "minimal" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high" ||
-    value === "xhigh" ||
-    value === "max"
-  ) {
-    return value;
-  }
-  throw new Error(`${label} is not a supported Pi thinking level`);
+  const thinking = THINKING_LEVELS.find((level) => level === jsonString(value));
+  if (thinking === undefined) throw new Error(`${label} is not a supported Pi thinking level`);
+  return thinking;
 }
 
 function requiredString(value: JsonValue | undefined, label: string): string {

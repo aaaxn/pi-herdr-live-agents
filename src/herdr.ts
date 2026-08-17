@@ -22,6 +22,11 @@ export type ExecCommand = (
   options?: { signal?: AbortSignal; timeout?: number },
 ) => Promise<ExecResult>;
 
+/** Every Herdr CLI call is bounded so a hung server cannot wedge the allocation lock. */
+const DEFAULT_COMMAND_TIMEOUT_MS = 30_000;
+/** Extra headroom over the `--timeout` Herdr itself applies to `agent start`. */
+const START_TIMEOUT_MARGIN_MS = 15_000;
+
 interface HerdrErrorDetail {
   message: string;
   code?: string;
@@ -66,11 +71,12 @@ export class HerdrClient {
 
   async requireVersion(minimum = "0.8.0", signal?: AbortSignal): Promise<string> {
     const versionResult = await this.run(["--version"], signal);
-    const match = versionResult.stdout.match(/(\d+)\.(\d+)\.(\d+)/);
-    if (!match) throw new Error(`Cannot parse Herdr version from '${versionResult.stdout.trim()}'`);
+    const firstLine = versionResult.stdout.trim().split("\n", 1)[0] ?? "";
+    const match = firstLine.match(/(\d+)\.(\d+)\.(\d+)/);
+    if (!match) throw new Error(`Cannot parse Herdr version from '${firstLine}'`);
     const current = match[0];
     if (compareVersions(current, minimum) < 0) {
-      throw new Error(`pi-herdr-subagents requires Herdr >=${minimum}; found ${current}`);
+      throw new Error(`pi-herdr-live-agents requires Herdr >=${minimum}; found ${current}`);
     }
 
     const statusResult = await this.run(["status", "--json"], signal);
@@ -82,7 +88,7 @@ export class HerdrClient {
       );
     }
     if (compareVersions(status.server.version, minimum) < 0) {
-      throw new Error(`pi-herdr-subagents requires Herdr server >=${minimum}; found ${status.server.version}`);
+      throw new Error(`pi-herdr-live-agents requires Herdr server >=${minimum}; found ${status.server.version}`);
     }
     return current;
   }
@@ -201,7 +207,7 @@ export class HerdrClient {
       "--",
       ...piArgs,
     ];
-    const result = await this.json<{ agent: HerdrAgent }>(args, input.signal);
+    const result = await this.json<{ agent: HerdrAgent }>(args, input.signal, (input.timeoutMs ?? 30_000) + START_TIMEOUT_MARGIN_MS);
     return result.agent;
   }
 
@@ -209,8 +215,8 @@ export class HerdrClient {
     await this.json(["agent", "send-keys", target, "esc"], signal);
   }
 
-  private async json<T = JsonObject>(args: string[], signal?: AbortSignal): Promise<T> {
-    const result = await this.run(args, signal);
+  private async json<T = JsonObject>(args: string[], signal?: AbortSignal, timeoutMs?: number): Promise<T> {
+    const result = await this.run(args, signal, timeoutMs);
     const text = result.stdout.trim();
     if (!text) throw new Error(`Herdr returned no JSON for: herdr ${args.join(" ")}`);
     let decoded: JsonValue;
@@ -227,16 +233,19 @@ export class HerdrClient {
       const code = jsonString(detail?.["code"]);
       throw new HerdrCommandError(message || code || "Herdr request failed", code);
     }
-    const payload = envelope?.["result"];
-    if (!payload) throw new Error(`Herdr response has no result for: herdr ${args.join(" ")}`);
+    if (envelope === undefined || !("result" in envelope)) {
+      throw new Error(`Herdr response has no result for: herdr ${args.join(" ")}`);
+    }
+    const payload = envelope["result"];
     // SAFETY: this method validates the envelope framing; the payload itself is the
     // `herdr <args> --json` result documented for the argv each caller passes, and every
     // call site names exactly that documented shape as T.
     return payload as T;
   }
 
-  private async run(args: string[], signal?: AbortSignal): Promise<ExecResult> {
-    const options = signal ? { signal } : undefined;
+  private async run(args: string[], signal?: AbortSignal, timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS): Promise<ExecResult> {
+    const options: NonNullable<Parameters<ExecCommand>[2]> = { timeout: timeoutMs };
+    if (signal) options.signal = signal;
     let result: ExecResult;
     try {
       result = await this.execute("herdr", args, options);
@@ -244,7 +253,10 @@ export class HerdrClient {
       if (signal?.aborted) throw new HerdrCommandError("Aborted", "aborted");
       throw error;
     }
-    if (signal?.aborted || result.killed) throw new HerdrCommandError("Aborted", "aborted");
+    if (signal?.aborted) throw new HerdrCommandError("Aborted", "aborted");
+    if (result.killed) {
+      throw new HerdrCommandError(`herdr timed out after ${timeoutMs}ms: herdr ${args.join(" ")}`, "timeout");
+    }
     if (result.code !== 0) {
       const parsed = parseHerdrError(result.stderr) ?? parseHerdrError(result.stdout);
       throw new HerdrCommandError(parsed?.message ?? `herdr exited with ${result.code}`, parsed?.code);
