@@ -1,12 +1,14 @@
-# pi-herdr-subagents
+# pi-herdr-live-agents
 
-**Pi subagents that run as real, visible Pi sessions in [Herdr](https://herdr.dev) panes.**
+**Visible Pi (sub)agents that run as real, live Pi sessions in [Herdr](https://herdr.dev) panes.**
 
-[![npm](https://img.shields.io/npm/v/@aaaxn/pi-herdr-subagents)](https://www.npmjs.com/package/@aaaxn/pi-herdr-subagents)
+[![npm](https://img.shields.io/npm/v/pi-herdr-live-agents)](https://www.npmjs.com/package/pi-herdr-live-agents)
 [![Pi extension](https://img.shields.io/badge/Pi-extension-blue)](https://pi.dev)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](./LICENSE)
 
-Every subagent is a normal Pi TUI in its own pane. You can watch it work, read its whole conversation, scroll its history, type into it, and keep it open after the delegated task finishes. The parent session still orchestrates the work through tools, so the model delegates exactly as it would with a headless extension.
+A parent session spawns each agent and receives its result, and that is where the hierarchy ends. Everything else is an ordinary Pi TUI in its own pane: you can watch it work, read the whole conversation, scroll its history, type into it, and keep the pane open long after the delegated task finished.
+
+The parent still orchestrates through tools, so the model delegates exactly as it would with a headless extension.
 
 ```text
 ┌─────────────────────────────────┬─────────────────────────────────┐
@@ -32,13 +34,13 @@ This package calls the Herdr CLI directly. `@ogulcancelik/pi-herdr` is optional 
 ## Install
 
 ```bash
-pi install npm:@aaaxn/pi-herdr-subagents
+pi install npm:pi-herdr-live-agents
 ```
 
 Try it without installing permanently:
 
 ```bash
-pi -e npm:@aaaxn/pi-herdr-subagents
+pi -e npm:pi-herdr-live-agents
 ```
 
 ## How a delegation runs
@@ -96,7 +98,7 @@ That forwards the last final response, plus your note, to the parent. Typing dur
 
 ## Model profiles
 
-Profiles choose only `provider`, `model`, and `thinking`. They never add a persona, system prompt, skill list, or tool list, so a subagent behaves like the Pi you already configured.
+Profiles choose only `provider`, `model`, and `thinking`. They never add a persona, system prompt, skill list, or tool list, so an agent behaves like the Pi you already configured.
 
 Configure them globally in `~/.pi/agent/pi-herdr-subagents.json`, or per project in `<project>/.pi/pi-herdr-subagents.json`, which is read only after you trust the project.
 
@@ -115,6 +117,8 @@ Configure them globally in `~/.pi/agent/pi-herdr-subagents.json`, or per project
 ```
 
 Without a profile, the child inherits the provider, model, and thinking level the parent is using.
+
+Config files, storage paths, and environment variables still use the earlier `subagent` spelling. Version 0.1.0 keeps them unchanged so existing setups keep working.
 
 ## Layout and limits
 

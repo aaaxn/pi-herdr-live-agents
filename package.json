@@ -1,13 +1,15 @@
 {
-  "name": "@aaaxn/pi-herdr-subagents",
-  "version": "0.1.0",
-  "description": "Pi subagents that run as real, visible Pi sessions in Herdr panes.",
+  "name": "pi-herdr-live-agents",
+  "version": "0.2.0",
+  "description": "Visible Pi (sub)agents that run as real, live Pi sessions in Herdr panes.",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi-extension",
     "pi-coding-agent",
     "herdr",
+    "agents",
+    "live-agents",
     "subagent",
     "subagents",
     "multi-agent",
@@ -17,13 +19,13 @@
   ],
   "author": "aaaxn <arturxavierns@gmail.com>",
   "license": "MIT",
-  "homepage": "https://github.com/aaaxn/pi-herdr-subagents#readme",
+  "homepage": "https://github.com/aaaxn/pi-herdr-live-agents#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/aaaxn/pi-herdr-subagents.git"
+    "url": "git+https://github.com/aaaxn/pi-herdr-live-agents.git"
   },
   "bugs": {
-    "url": "https://github.com/aaaxn/pi-herdr-subagents/issues"
+    "url": "https://github.com/aaaxn/pi-herdr-live-agents/issues"
   },
   "publishConfig": {
     "access": "public"
