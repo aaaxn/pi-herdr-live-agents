@@ -55,7 +55,7 @@ describe("AgentManager", () => {
     const receipt = await manager.spawn({
       taskName: "explore-auth",
       message: "Map the authentication flow.",
-      inherited: { provider: "openai", model: "gpt-test", thinking: "high" },
+      model: { provider: "openai", model: "gpt-test", thinking: "high" },
     });
 
     expect(receipt.accepted).toBe(true);
@@ -113,7 +113,7 @@ describe("AgentManager", () => {
     const receipt = await manager.spawn({
       taskName: "multi-turn",
       message: "Return twice.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
     const stored = listSessionRuns("parent-1")[0]!;
     writeResult(stored.directory, {
@@ -155,8 +155,8 @@ describe("AgentManager", () => {
     await manager.start();
 
     const outcomes = await Promise.allSettled([
-      manager.spawn({ taskName: "first", message: "First task", inherited: { provider: "openai", model: "gpt-test" } }),
-      manager.spawn({ taskName: "second", message: "Second task", inherited: { provider: "openai", model: "gpt-test" } }),
+      manager.spawn({ taskName: "first", message: "First task", model: { provider: "openai", model: "gpt-test" } }),
+      manager.spawn({ taskName: "second", message: "Second task", model: { provider: "openai", model: "gpt-test" } }),
     ]);
 
     expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
@@ -175,7 +175,7 @@ describe("AgentManager", () => {
     const receipt = await manager.spawn({
       taskName: "slow-shell",
       message: "Start once the shell is ready.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
 
     expect(receipt.accepted).toBe(true);
@@ -194,14 +194,14 @@ describe("AgentManager", () => {
     const first = manager.spawn({
       taskName: "slow-ack",
       message: "Acknowledge later.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
     await vi.waitFor(() => expect(manager.list()[0]?.agent_status).toBe("idle"));
     await expect(
       manager.spawn({
         taskName: "over-limit",
         message: "Must be rejected.",
-        inherited: { provider: "openai", model: "gpt-test" },
+        model: { provider: "openai", model: "gpt-test" },
       }),
     ).rejects.toThrow("Concurrent agent limit reached");
     await first;
@@ -233,7 +233,7 @@ describe("AgentManager", () => {
     const receipt = await manager.spawn({
       taskName: "isolated",
       message: "Use an owned tab.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
 
     expect(herdr.splitCalls).toHaveLength(0);
@@ -250,7 +250,7 @@ describe("AgentManager", () => {
     const receipt = await manager.spawn({
       taskName: "closed-recovery",
       message: "Finish and remain recorded.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
     await manager.close(receipt.run_id, { force: true });
     const stored = listSessionRuns("parent-1")[0]!;
@@ -299,7 +299,7 @@ describe("AgentManager", () => {
     const receipt = await manager.spawn({
       taskName: "moved",
       message: "Keep working after a move.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
     herdr.moveAgent(receipt.pane_id, "moved-pane", "moved-tab");
     manager.stop();
@@ -319,7 +319,7 @@ describe("AgentManager", () => {
     await manager.spawn({
       taskName: "blocked-native",
       message: "Wait for approval.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
     manager.stop();
     herdr.setAgentStatus("blocked");
@@ -344,7 +344,7 @@ describe("AgentManager", () => {
     await manager.spawn({
       taskName: "transient",
       message: "Remain open.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
     const before = manager.list()[0]?.agent_status;
     herdr.getPaneError = new HerdrCommandError("socket unavailable", "transport_error");
@@ -361,7 +361,7 @@ describe("AgentManager", () => {
     await manager.spawn({
       taskName: "abort-close",
       message: "Remain open.",
-      inherited: { provider: "openai", model: "gpt-test" },
+      model: { provider: "openai", model: "gpt-test" },
     });
     herdr.closeError = new HerdrCommandError("Aborted", "aborted");
 

@@ -106,6 +106,21 @@ describe("RootRuntime waits", () => {
 
     await expect(waiting).rejects.toThrow("closed without a result");
   });
+
+  it("settles an untargeted waiter when the last pending pane closes without a result", async () => {
+    const runtime = createRuntime();
+    const run = runRecord("run-gone", "gone-agent", "working");
+    let awaiting = true;
+    vi.spyOn(runtime.manager, "getRun").mockImplementation(() => run);
+    vi.spyOn(runtime.manager, "list").mockImplementation(() => [summary(run, awaiting)]);
+
+    const waiting = runtime.waitOne(undefined);
+    run.status = "closed";
+    awaiting = false;
+    runtime.handleManagerChange();
+
+    await expect(waiting).rejects.toThrow("without an undelivered result");
+  });
 });
 
 function createRuntime(sendMessage = vi.fn()): RootRuntime {

@@ -47,7 +47,7 @@ describe.runIf(enabled)("real Herdr subagent", () => {
       receipt = await manager.spawn({
         taskName: "smoke-check",
         message: "Reply with exactly this text and nothing else: SMOKE OK",
-        inherited: {
+        model: {
           provider: process.env.PI_HERDR_SMOKE_PROVIDER ?? "anthropic",
           model: process.env.PI_HERDR_SMOKE_MODEL ?? "claude-opus-5",
           thinking: "low",
@@ -78,10 +78,13 @@ function runHerdr(command: string, args: string[]): Promise<ExecResult> {
   return new Promise((resolve) => {
     execFile(command, args, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
       const exitCode = error?.code;
+      // A string code (ENOENT, a signal name) would otherwise collapse into a bare
+      // exit 1 and hide the real failure cause from a five-minute smoke run.
+      const detail = error && !isJsonNumber(exitCode) ? `${stderr}\n${String(exitCode ?? error.message)}`.trim() : stderr;
       resolve({
         code: isJsonNumber(exitCode) ? exitCode : error ? 1 : 0,
         stdout,
-        stderr,
+        stderr: detail,
       });
     });
   });

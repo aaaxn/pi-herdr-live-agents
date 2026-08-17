@@ -118,7 +118,7 @@ Configure them globally in `~/.pi/agent/pi-herdr-subagents.json`, or per project
 
 Without a profile, the child inherits the provider, model, and thinking level the parent is using.
 
-Config files, storage paths, and environment variables still use the earlier `subagent` spelling. Version 0.1.0 keeps them unchanged so existing setups keep working.
+Config files, storage paths, and environment variables still use the earlier `subagent` spelling. They stay unchanged so existing setups keep working.
 
 ## Layout and limits
 
@@ -126,13 +126,14 @@ Splits happen only when both resulting panes stay at least 72x20. Otherwise the 
 
 Defaults allow 4 agents starting, working, or blocked at once and 8 open panes. There is no hidden queue: past the limit, `spawn_agent` fails and tells the model to wait or close a pane.
 
-Agents share your working tree. Version 0.1.0 does not create worktrees, so parallel write tasks should touch separate files.
+Agents share your working tree. This extension does not create worktrees, so parallel write tasks should touch separate files.
 
 ## Data and retention
 
 Coordination state lives under `~/.pi/agent/pi-herdr-subagents/runs/<parent-scope>/<run-id>/`, readable only by you. The mailbox uses versioned JSON, atomic writes, capability tokens, and acknowledgements, and each run belongs to one exact parent session.
 
-- Inbox files are deleted only after Pi confirms the delegated input arrived.
+- Inbox files are deleted once Pi confirms the delegated input arrived, or after a failed acknowledgement when Pi never confirms a delivered input.
+- The capability token never travels through the pane environment or Herdr argv; the child reads it from the private `run.json`.
 - Active runs and open panes are never cleaned up.
 - Closed runs with delivered results are kept for 7 days, and closed runs with an undelivered result for 30 days.
 - Each run keeps the retention values that applied when it started, and `0` disables deletion for that category.

@@ -9,10 +9,10 @@ import type {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadConfig } from "./config.js";
-import { HerdrClient } from "./herdr.js";
+import { HerdrClient, HerdrCommandError } from "./herdr.js";
 import { errorMessage } from "./json.js";
 import { AgentManager, type SpawnInput, type SpawnReceipt } from "./manager.js";
-import type { AgentStatus, AgentSummary, ExtensionConfig, ModelProfile, RunRecord, RunResult } from "./types.js";
+import { ACTIVE_STATUSES, type AgentStatus, type AgentSummary, type ExtensionConfig, type ModelProfile, type RunRecord, type RunResult } from "./types.js";
 import { sliceUtf8 } from "./utf8.js";
 
 const RESULT_MESSAGE_TYPE = "pi-herdr-subagent-result";
@@ -21,7 +21,6 @@ const WIDGET_KEY = "pi-herdr-subagents";
 const SUCCESS_DEBOUNCE_MS = 500;
 const SUCCESS_MAX_WAIT_MS = 1_000;
 const AUTO_RESULT_LIMIT = 64 * 1024;
-const ACTIVE_STATUSES = new Set<AgentStatus>(["starting", "working", "blocked"]);
 const FINAL_STATUSES = new Set<AgentStatus>(["done", "failed", "interrupted", "closed"]);
 
 type Completion = { run: RunRecord; result: RunResult };
@@ -166,17 +165,26 @@ export class RootRuntime {
     if (this.ctx.mode === "tui") this.ctx.ui.setWidget(WIDGET_KEY, undefined);
   }
 
+  /** The single place a spawn's profile name is resolved into a concrete model. */
   async spawn(params: { task_name: string; message: string; profile?: string }, ctx: ExtensionContext, signal?: AbortSignal) {
     const current = ctx.model;
     if (!current?.provider || !current.id) throw new Error("The parent Pi session has no active provider/model pair");
     const selectedName = params.profile ?? this.config.defaultProfile;
-    const selected = selectedName ? this.config.profiles[selectedName] : undefined;
-    if (selectedName && !selected) throw new Error(`Unknown model profile '${selectedName}'`);
-    const model: ModelProfile = selected ?? {
-      provider: current.provider,
-      model: current.id,
-      thinking: ctx.thinkingLevel ?? this.pi.getThinkingLevel(),
-    };
+    let model: ModelProfile;
+    if (selectedName) {
+      const selected = this.config.profiles[selectedName];
+      if (!selected) {
+        const available = Object.keys(this.config.profiles).join(", ") || "none";
+        throw new Error(`Unknown model profile '${selectedName}'. Available profiles: ${available}`);
+      }
+      model = selected;
+    } else {
+      model = {
+        provider: current.provider,
+        model: current.id,
+        thinking: ctx.thinkingLevel ?? this.pi.getThinkingLevel(),
+      };
+    }
     if (!ctx.modelRegistry.getAvailable().some((candidate) => candidate.provider === model.provider && candidate.id === model.model)) {
       throw new Error(`Model '${model.provider}/${model.model}' is not available in the parent Pi runtime`);
     }
@@ -184,16 +192,16 @@ export class RootRuntime {
     const input: SpawnInput = {
       taskName: params.task_name,
       message: params.message,
-      inherited: model,
+      model,
     };
-    if (params.profile) input.profile = params.profile;
+    if (selectedName) input.profile = selectedName;
     if (parentSessionFile) input.parentSessionFile = parentSessionFile;
     if (signal) input.signal = signal;
     return this.manager.spawn(input);
   }
 
   waitOne(targets: string[] | undefined, signal?: AbortSignal): Promise<CompletionPayload> {
-    if (signal?.aborted) return Promise.reject(new Error("Aborted"));
+    if (signal?.aborted) return Promise.reject(new HerdrCommandError("Aborted", "aborted"));
     const cleanTargets = targets?.map(cleanTarget).filter(Boolean);
     if (targets && cleanTargets?.length === 0) return Promise.reject(new Error("targets must not be empty"));
     const targetRuns = cleanTargets?.map((target) => this.manager.getRun(target));
@@ -229,7 +237,7 @@ export class RootRuntime {
       if (targetIds) waiter.targets = targetIds;
       const removeAbort = bindAbort(signal, () => {
         this.waiters.delete(waiter);
-        reject(new Error("Aborted"));
+        reject(new HerdrCommandError("Aborted", "aborted"));
       });
       if (removeAbort) waiter.removeAbort = removeAbort;
       this.waiters.add(waiter);
@@ -237,7 +245,7 @@ export class RootRuntime {
   }
 
   waitAll(targets: string[] | undefined, signal?: AbortSignal): Promise<CompletionPayload[]> {
-    if (signal?.aborted) return Promise.reject(new Error("Aborted"));
+    if (signal?.aborted) return Promise.reject(new HerdrCommandError("Aborted", "aborted"));
     const cleanTargets = targets?.map(cleanTarget).filter(Boolean);
     if (targets && cleanTargets?.length === 0) return Promise.reject(new Error("targets must not be empty"));
     const selectedRuns = cleanTargets
@@ -278,7 +286,7 @@ export class RootRuntime {
       const removeAbort = bindAbort(signal, () => {
         this.waiters.delete(waiter);
         this.releaseWaiterResults(waiter);
-        reject(new Error("Aborted"));
+        reject(new HerdrCommandError("Aborted", "aborted"));
       });
       if (removeAbort) waiter.removeAbort = removeAbort;
       this.waiters.add(waiter);
@@ -291,7 +299,10 @@ export class RootRuntime {
     // Snapshot the waiters: rejecting one removes it from the set while this loop runs.
     const waiters = [...this.waiters];
     for (const waiter of waiters) {
-      if (waiter.kind === "one" && !waiter.targets) continue;
+      if (waiter.kind === "one" && !waiter.targets) {
+        this.settleUntargetedWaiter(waiter);
+        continue;
+      }
       const targets = waiter.targets ?? new Set<string>();
       for (const runId of targets) {
         let run: RunRecord;
@@ -312,6 +323,24 @@ export class RootRuntime {
         break;
       }
     }
+  }
+
+  /**
+   * An untargeted wait_agent must not hang forever once nothing can complete:
+   * when no run is still awaiting a result, hand over any undelivered completion
+   * or reject so the model regains control.
+   */
+  private settleUntargetedWaiter(waiter: OneWaiter): void {
+    if (this.manager.list().some((agent) => agent.awaiting_result)) return;
+    this.waiters.delete(waiter);
+    waiter.removeAbort?.();
+    const existing = this.findExistingCompletion(undefined, true);
+    if (existing) {
+      this.manager.markDelivered(existing.run.runId, existing.result.resultId);
+      waiter.resolve(completionPayload(existing.run, existing.result));
+      return;
+    }
+    waiter.reject(new Error("Every subagent closed or finished without an undelivered result"));
   }
 
   private releaseWaiterResults(waiter: CompletionWaiter): void {
@@ -370,17 +399,24 @@ export class RootRuntime {
   private deliverCompletions(completions: Completion[]): void {
     if (this.disposed) return;
     const payload = completions.map(({ run, result }) => boundedCompletionPayload(run, result));
-    this.pi.sendMessage<ResultMessageDetails>(
-      {
-        customType: RESULT_MESSAGE_TYPE,
-        content: `<herdr_subagent_results>\n${JSON.stringify(payload, null, 2)}\n</herdr_subagent_results>`,
-        display: true,
-        details: {
-          agents: payload.map((entry) => ({ name: entry.agent_name, status: entry.status })),
+    try {
+      this.pi.sendMessage<ResultMessageDetails>(
+        {
+          customType: RESULT_MESSAGE_TYPE,
+          content: `<herdr_subagent_results>\n${JSON.stringify(payload, null, 2)}\n</herdr_subagent_results>`,
+          display: true,
+          details: {
+            agents: payload.map((entry) => ({ name: entry.agent_name, status: entry.status })),
+          },
         },
-      },
-      this.ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer", triggerTurn: true },
-    );
+        this.ctx.isIdle() ? { triggerTurn: true } : { deliverAs: "steer", triggerTurn: true },
+      );
+    } catch {
+      // Never drop a result on a delivery failure: requeue it for the next flush.
+      for (const completion of completions) this.pendingSuccesses.set(resultKey(completion), completion);
+      if (!this.maxWaitTimer) this.maxWaitTimer = setTimeout(() => this.flushSuccesses(), SUCCESS_MAX_WAIT_MS);
+      return;
+    }
     for (const { run, result } of completions) this.manager.markDelivered(run.runId, result.resultId);
   }
 
@@ -461,7 +497,7 @@ export function registerRootRuntime(pi: ExtensionAPI): void {
 
   const requireRuntime = (): RootRuntime => {
     if (active) return active;
-    throw new Error(startupError ?? "pi-herdr-subagents is not attached to an active parent session");
+    throw new Error(startupError ?? "pi-herdr-live-agents is not attached to an active parent session");
   };
 
   const spawnTool = () => ({
@@ -539,7 +575,7 @@ export function registerRootRuntime(pi: ExtensionAPI): void {
     startupError = undefined;
     const parentPaneId = process.env.HERDR_PANE_ID;
     if (process.env.HERDR_ENV !== "1" || !parentPaneId) {
-      startupError = "pi-herdr-subagents requires Pi to run inside Herdr (HERDR_ENV=1)";
+      startupError = "pi-herdr-live-agents requires Pi to run inside Herdr (HERDR_ENV=1)";
       ctx.ui.notify(startupError, "warning");
       return;
     }
@@ -549,12 +585,11 @@ export function registerRootRuntime(pi: ExtensionAPI): void {
       const runtime = new RootRuntime(pi, ctx, config, herdr, parentPaneId);
       active = runtime;
       await runtime.start();
-      pi.registerTool(spawnTool());
     } catch (error) {
       active?.dispose();
       active = undefined;
       startupError = errorMessage(error);
-      ctx.ui.notify(`pi-herdr-subagents: ${startupError}`, "error");
+      ctx.ui.notify(`pi-herdr-live-agents: ${startupError}`, "error");
     }
   });
 

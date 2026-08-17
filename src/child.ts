@@ -43,8 +43,8 @@ type PendingInput = {
   sentAt: number;
 };
 
-export function registerChildRuntime(pi: ExtensionAPI, directory: string): void {
-  const record = requireOwnedRun(directory);
+export function registerChildRuntime(pi: ExtensionAPI, directory: string, expectedRunId?: string): void {
+  const record = requireOwnedRun(directory, expectedRunId);
   let activeContext: ExtensionContext | undefined;
   let pollTimer: NodeJS.Timeout | undefined;
   let polling = false;
@@ -92,7 +92,7 @@ export function registerChildRuntime(pi: ExtensionAPI, directory: string): void 
     if (!ctx || polling) return;
     polling = true;
     try {
-      expirePendingInputs(directory, record, pendingInputs);
+      expirePendingInputs(directory, record, pendingInputs, active);
       if ([...pendingInputs.values()].some((entries) => entries.length > 0)) return;
       const next = listDispatches(directory, record.runId, record.capabilityToken)[0];
       if (!next) return;
@@ -124,6 +124,7 @@ export function registerChildRuntime(pi: ExtensionAPI, directory: string): void 
   };
 
   pi.on("session_start", (_event, ctx) => {
+    if (pollTimer) clearInterval(pollTimer);
     activeContext = ctx;
     active = !ctx.isIdle();
     publishState(desiredActiveStatus(), blockedMessage);
@@ -286,10 +287,15 @@ function expirePendingInputs(
   directory: string,
   record: RunRecord,
   pendingInputs: Map<string, PendingInput[]>,
+  agentActive: boolean,
 ): void {
   const deadline = Date.now() - INPUT_CONFIRM_TIMEOUT_MS;
   for (const [message, entries] of pendingInputs) {
-    const stale = entries.filter((entry) => entry.sentAt <= deadline);
+    // A queued follow-up is only consumed when the current turn ends, so it may
+    // legitimately wait far longer than the confirm timeout while the agent works.
+    const expirable = (entry: PendingInput): boolean =>
+      entry.sentAt <= deadline && (entry.deliveryState === "delivered" || !agentActive);
+    const stale = entries.filter(expirable);
     if (stale.length === 0) continue;
     for (const pending of stale) {
       writeAck(directory, {
@@ -305,7 +311,7 @@ function expirePendingInputs(
       removeDispatch(pending.filePath);
       appendEvent(directory, "dispatch.input-timeout", { requestId: pending.request.requestId });
     }
-    const activeEntries = entries.filter((entry) => entry.sentAt > deadline);
+    const activeEntries = entries.filter((entry) => !expirable(entry));
     if (activeEntries.length === 0) pendingInputs.delete(message);
     else pendingInputs.set(message, activeEntries);
   }
@@ -358,12 +364,15 @@ function latestAssistantFromSession(ctx: ExtensionContext): string {
   return "";
 }
 
-function requireOwnedRun(directory: string): RunRecord {
+/**
+ * Ownership is proven by readability: the run directory and run.json are created
+ * 0700/0600 by the parent, so only the same user can decode the capability token.
+ * The token itself never travels through the pane environment or Herdr argv.
+ */
+function requireOwnedRun(directory: string, expectedRunId?: string): RunRecord {
   const record = readRun(directory);
-  const token = process.env.PI_HERDR_SUBAGENT_TOKEN;
-  const runId = process.env.PI_HERDR_SUBAGENT_RUN_ID;
-  if (!record || !token || !runId || record.runId !== runId || record.capabilityToken !== token) {
-    throw new Error("Invalid pi-herdr-subagents child ownership metadata");
+  if (!record || (expectedRunId !== undefined && record.runId !== expectedRunId)) {
+    throw new Error("Invalid pi-herdr-live-agents child ownership metadata");
   }
   return record;
 }

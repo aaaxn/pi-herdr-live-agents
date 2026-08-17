@@ -12,7 +12,9 @@ import {
   type JsonValue,
 } from "./json.js";
 import {
+  AGENT_STATUSES,
   PROTOCOL_VERSION,
+  THINKING_LEVELS,
   type AgentStatus,
   type ChildState,
   type DispatchAck,
@@ -134,10 +136,6 @@ export function writeAck(directory: string, ack: DispatchAck): void {
 
 export function readAck(directory: string, requestId: string, capabilityToken: string): DispatchAck | undefined {
   return decodeAck(readJsonObject(ackPath(directory, requestId)), requestId, capabilityToken);
-}
-
-export function removeAck(directory: string, requestId: string): void {
-  fs.rmSync(ackPath(directory, requestId), { force: true });
 }
 
 export function writeChildState(directory: string, state: ChildState): void {
@@ -477,34 +475,13 @@ function decodeStringList(value: JsonValue | undefined): string[] | undefined {
 }
 
 function decodeAgentStatus(value: JsonValue | undefined): AgentStatus | undefined {
-  if (
-    value === "starting" ||
-    value === "working" ||
-    value === "blocked" ||
-    value === "done" ||
-    value === "failed" ||
-    value === "interrupted" ||
-    value === "idle" ||
-    value === "closed"
-  ) {
-    return value;
-  }
-  return undefined;
+  const text = jsonString(value);
+  return AGENT_STATUSES.find((status) => status === text);
 }
 
 function decodeThinking(value: JsonValue | undefined): ThinkingLevel | undefined {
-  if (
-    value === "off" ||
-    value === "minimal" ||
-    value === "low" ||
-    value === "medium" ||
-    value === "high" ||
-    value === "xhigh" ||
-    value === "max"
-  ) {
-    return value;
-  }
-  return undefined;
+  const text = jsonString(value);
+  return THINKING_LEVELS.find((level) => level === text);
 }
 
 function decodePlacement(value: JsonValue | undefined): PanePlacement | undefined {
