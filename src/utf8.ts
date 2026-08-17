@@ -1,8 +1,10 @@
-export function sliceUtf8(
-  value: string,
-  offset: number,
-  limit: number,
-): { text: string; totalBytes: number; nextOffset?: number } {
+export interface Utf8Slice {
+  text: string;
+  totalBytes: number;
+  nextOffset?: number;
+}
+
+export function sliceUtf8(value: string, offset: number, limit: number): Utf8Slice {
   if (!Number.isInteger(offset) || offset < 0) throw new Error("offset must be a non-negative integer");
   if (!Number.isInteger(limit) || limit < 1) throw new Error("limit must be a positive integer");
   const data = Buffer.from(value, "utf8");
@@ -18,11 +20,12 @@ export function sliceUtf8(
     while (end < data.length && isContinuation(data[end]!)) end += 1;
   }
 
-  return {
+  const slice: Utf8Slice = {
     text: data.subarray(offset, end).toString("utf8"),
     totalBytes: data.length,
-    ...(end < data.length ? { nextOffset: end } : {}),
   };
+  if (end < data.length) slice.nextOffset = end;
+  return slice;
 }
 
 function isContinuation(byte: number): boolean {

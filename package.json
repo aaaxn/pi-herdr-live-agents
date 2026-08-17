@@ -1,22 +1,40 @@
 {
-  "name": "pi-herdr-subagents",
+  "name": "@aaaxn/pi-herdr-subagents",
   "version": "0.1.0",
-  "description": "Visible, session-scoped Pi subagents running in real Herdr panes.",
+  "description": "Pi subagents that run as real, visible Pi sessions in Herdr panes.",
   "type": "module",
   "keywords": [
     "pi-package",
     "pi-extension",
+    "pi-coding-agent",
     "herdr",
+    "subagent",
     "subagents",
-    "multi-agent"
+    "multi-agent",
+    "orchestration",
+    "terminal",
+    "panes"
   ],
+  "author": "aaaxn <arturxavierns@gmail.com>",
   "license": "MIT",
+  "homepage": "https://github.com/aaaxn/pi-herdr-subagents#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aaaxn/pi-herdr-subagents.git"
+  },
+  "bugs": {
+    "url": "https://github.com/aaaxn/pi-herdr-subagents/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=22.19.0"
   },
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
+    "lint": "oxlint",
     "check": "npm run typecheck && npm test"
   },
   "peerDependencies": {
@@ -29,7 +47,9 @@
     "@earendil-works/pi-ai": "0.84.2",
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@earendil-works/pi-tui": "0.84.2",
+    "@oxlint/plugins": "1.78.0",
     "@types/node": "24.12.4",
+    "oxlint": "1.78.0",
     "typebox": "1.3.7",
     "typescript": "5.9.3",
     "vitest": "4.1.9"

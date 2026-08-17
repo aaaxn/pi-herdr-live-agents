@@ -1,6 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  errorMessage,
+  isJsonObject,
+  jsonNumber,
+  jsonObject,
+  jsonString,
+  parseJsonText,
+  type JsonObject,
+  type JsonValue,
+} from "./json.js";
 import type { ExtensionConfig, ModelProfile, ThinkingLevel } from "./types.js";
 
 export const DEFAULT_CONFIG: ExtensionConfig = {
@@ -42,8 +52,7 @@ export function loadConfig(
     throw new Error(`defaultProfile '${defaultProfile}' does not exist in profiles`);
   }
 
-  return {
-    ...(defaultProfile ? { defaultProfile } : {}),
+  const config: ExtensionConfig = {
     profiles,
     layout: {
       minPaneWidth: positiveInteger(raw.layout?.minPaneWidth, DEFAULT_CONFIG.layout.minPaneWidth, "layout.minPaneWidth"),
@@ -70,59 +79,73 @@ export function loadConfig(
       ),
     },
   };
+  if (defaultProfile !== undefined) config.defaultProfile = defaultProfile;
+  return config;
 }
 
-type ConfigLayer = {
-  defaultProfile?: unknown;
-  profiles?: unknown;
-  layout?: Record<string, unknown>;
-  limits?: Record<string, unknown>;
-  retention?: Record<string, unknown>;
-};
+interface ConfigLayer {
+  defaultProfile?: JsonValue | undefined;
+  profiles?: JsonValue | undefined;
+  layout?: JsonObject | undefined;
+  limits?: JsonObject | undefined;
+  retention?: JsonObject | undefined;
+}
 
 function readConfigLayer(filePath: string): ConfigLayer {
   if (!fs.existsSync(filePath)) return {};
-  let value: unknown;
+  let value: JsonValue;
   try {
-    value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    value = parseJsonText(fs.readFileSync(filePath, "utf8"));
   } catch (error) {
-    throw new Error(`Cannot parse ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`Cannot parse ${filePath}: ${errorMessage(error)}`);
   }
-  if (!isRecord(value)) throw new Error(`${filePath} must contain a JSON object`);
-  return value;
+  if (!isJsonObject(value)) throw new Error(`${filePath} must contain a JSON object`);
+  return {
+    defaultProfile: value.defaultProfile,
+    profiles: value.profiles,
+    layout: jsonObject(value.layout),
+    limits: jsonObject(value.limits),
+    retention: jsonObject(value.retention),
+  };
 }
 
 function mergeLayers(global: ConfigLayer, project: ConfigLayer): ConfigLayer {
   return {
     defaultProfile: project.defaultProfile ?? global.defaultProfile,
-    profiles: {
-      ...(isRecord(global.profiles) ? global.profiles : {}),
-      ...(isRecord(project.profiles) ? project.profiles : {}),
-    },
+    profiles: { ...jsonObject(global.profiles), ...jsonObject(project.profiles) },
     layout: { ...global.layout, ...project.layout },
     limits: { ...global.limits, ...project.limits },
     retention: { ...global.retention, ...project.retention },
   };
 }
 
-function parseProfiles(value: unknown, label: string): Record<string, ModelProfile> {
+function parseProfiles(value: JsonValue | undefined, label: string): Record<string, ModelProfile> {
   if (value === undefined) return {};
-  if (!isRecord(value)) throw new Error(`${label} must be an object`);
-  const profiles: Record<string, ModelProfile> = {};
-  for (const [name, raw] of Object.entries(value)) {
-    if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name)) {
-      throw new Error(`${label}.${name} must use lowercase letters, digits, underscores, or dashes`);
-    }
-    if (!isRecord(raw)) throw new Error(`${label}.${name} must be an object`);
-    const provider = requiredString(raw.provider, `${label}.${name}.provider`);
-    const model = requiredString(raw.model, `${label}.${name}.model`);
-    const thinking = parseThinking(raw.thinking, `${label}.${name}.thinking`);
-    profiles[name] = { provider, model, ...(thinking ? { thinking } : {}) };
-  }
-  return profiles;
+  const entries = jsonObject(value);
+  if (entries === undefined) throw new Error(`${label} must be an object`);
+  return Object.fromEntries(
+    Object.entries(entries).map(([name, raw]) => {
+      if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name)) {
+        throw new Error(`${label}.${name} must use lowercase letters, digits, underscores, or dashes`);
+      }
+      return [name, parseProfile(raw, `${label}.${name}`)];
+    }),
+  );
 }
 
-function parseThinking(value: unknown, label: string): ThinkingLevel | undefined {
+function parseProfile(value: JsonValue | undefined, label: string): ModelProfile {
+  const raw = jsonObject(value);
+  if (raw === undefined) throw new Error(`${label} must be an object`);
+  const profile: ModelProfile = {
+    provider: requiredString(raw.provider, `${label}.provider`),
+    model: requiredString(raw.model, `${label}.model`),
+  };
+  const thinking = parseThinking(raw.thinking, `${label}.thinking`);
+  if (thinking !== undefined) profile.thinking = thinking;
+  return profile;
+}
+
+function parseThinking(value: JsonValue | undefined, label: string): ThinkingLevel | undefined {
   if (value === undefined) return undefined;
   if (
     value === "off" ||
@@ -138,30 +161,33 @@ function parseThinking(value: unknown, label: string): ThinkingLevel | undefined
   throw new Error(`${label} is not a supported Pi thinking level`);
 }
 
-function requiredString(value: unknown, label: string): string {
+function requiredString(value: JsonValue | undefined, label: string): string {
   const parsed = optionalString(value, label);
   if (!parsed) throw new Error(`${label} must be a non-empty string`);
   return parsed;
 }
 
-function optionalString(value: unknown, label: string): string | undefined {
+function optionalString(value: JsonValue | undefined, label: string): string | undefined {
   if (value === undefined) return undefined;
-  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must be a non-empty string`);
-  return value.trim();
+  const text = jsonString(value);
+  if (text === undefined || !text.trim()) throw new Error(`${label} must be a non-empty string`);
+  return text.trim();
 }
 
-function positiveInteger(value: unknown, fallback: number, label: string): number {
+function positiveInteger(value: JsonValue | undefined, fallback: number, label: string): number {
   if (value === undefined) return fallback;
-  if (!Number.isInteger(value) || (value as number) < 1) throw new Error(`${label} must be a positive integer`);
-  return value as number;
+  const parsed = jsonNumber(value);
+  if (parsed === undefined || !Number.isInteger(parsed) || parsed < 1) {
+    throw new Error(`${label} must be a positive integer`);
+  }
+  return parsed;
 }
 
-function nonNegativeInteger(value: unknown, fallback: number, label: string): number {
+function nonNegativeInteger(value: JsonValue | undefined, fallback: number, label: string): number {
   if (value === undefined) return fallback;
-  if (!Number.isInteger(value) || (value as number) < 0) throw new Error(`${label} must be a non-negative integer`);
-  return value as number;
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+  const parsed = jsonNumber(value);
+  if (parsed === undefined || !Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a non-negative integer`);
+  }
+  return parsed;
 }
