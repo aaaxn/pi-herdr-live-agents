@@ -14,13 +14,28 @@ import {
   writeChildState,
   writeResult,
 } from "./storage.js";
-import { PROTOCOL_VERSION, type AgentStatus, type DispatchRequest, type RunRecord, type RunResult } from "./types.js";
+import { errorMessage, jsonObject, jsonString, parseJsonText, type JsonValue } from "./json.js";
+import {
+  PROTOCOL_VERSION,
+  type AgentStatus,
+  type ChildState,
+  type DispatchRequest,
+  type RunRecord,
+  type RunResult,
+} from "./types.js";
 
 const POLL_INTERVAL_MS = 150;
 const INPUT_CONFIRM_TIMEOUT_MS = 5_000;
 const TURN_FILE = "linked-turn.json";
 
 type AgentMessage = AgentEndEvent["messages"][number];
+/** The caller-supplied half of a RunResult; the rest is stamped by createResult. */
+type ResultInput = Omit<RunResult, "version" | "type" | "resultId" | "runId" | "capabilityToken" | "createdAt">;
+interface AssistantOutcome {
+  response: string;
+  status: Extract<AgentStatus, "done" | "failed" | "interrupted">;
+  error?: string;
+}
 type PendingInput = {
   request: DispatchRequest;
   filePath: string;
@@ -52,17 +67,18 @@ export function registerChildRuntime(pi: ExtensionAPI, directory: string): void 
     stateSeq += 1;
     const childSessionId = ctx?.sessionManager.getSessionId();
     const childSessionFile = ctx?.sessionManager.getSessionFile();
-    writeChildState(directory, {
+    const state: ChildState = {
       version: PROTOCOL_VERSION,
       runId: record.runId,
       capabilityToken: record.capabilityToken,
       seq: stateSeq,
       status,
-      ...(message ? { message } : {}),
-      ...(childSessionId ? { childSessionId } : {}),
-      ...(childSessionFile ? { childSessionFile } : {}),
       updatedAt: Date.now(),
-    });
+    };
+    if (message) state.message = message;
+    if (childSessionId) state.childSessionId = childSessionId;
+    if (childSessionFile) state.childSessionFile = childSessionFile;
+    writeChildState(directory, state);
   };
 
   const desiredActiveStatus = (): AgentStatus => {
@@ -101,9 +117,7 @@ export function registerChildRuntime(pi: ExtensionAPI, directory: string): void 
       }
       deliverRequest(pi, ctx, next, pendingInputs);
     } catch (error) {
-      appendEvent(directory, "dispatch.consume-failed", {
-        error: error instanceof Error ? error.message : String(error),
-      });
+      appendEvent(directory, "dispatch.consume-failed", { error: errorMessage(error) });
     } finally {
       polling = false;
     }
@@ -194,27 +208,29 @@ export function registerChildRuntime(pi: ExtensionAPI, directory: string): void 
     }
 
     terminalized = true;
-    const result = createResult(record, {
+    const resultInput: ResultInput = {
       requestId: currentLinkedRequestId,
       source: "linked-turn",
       status: lastStatus,
       response: lastResponse,
-      ...(lastError ? { error: lastError } : {}),
-    });
-    writeResult(directory, result);
+    };
+    if (lastError) resultInput.error = lastError;
+    writeResult(directory, createResult(record, resultInput));
     publishState(lastStatus, lastError);
     currentLinkedRequestId = undefined;
     clearLinkedTurn(directory);
   });
 
-  pi.events.on("herdr:blocked", (data: unknown) => {
-    const value = isRecord(data) ? data : {};
-    if (value.active === false) {
+  pi.events.on("herdr:blocked", (data) => {
+    // SAFETY: the herdr:blocked channel carries a plain JSON-compatible payload, and
+    // jsonObject re-checks the shape at runtime, so an unexpected value decodes to undefined.
+    const value = jsonObject(data as JsonValue);
+    if (value?.active === false) {
       blockedCount = Math.max(0, blockedCount - 1);
       if (blockedCount === 0) blockedMessage = undefined;
-    } else if (value.active === true) {
+    } else if (value?.active === true) {
       blockedCount += 1;
-      blockedMessage = typeof value.label === "string" ? value.label : "Waiting for input";
+      blockedMessage = jsonString(value.label) ?? "Waiting for input";
     }
     publishState(desiredActiveStatus(), blockedMessage);
   });
@@ -228,15 +244,15 @@ export function registerChildRuntime(pi: ExtensionAPI, directory: string): void 
         return;
       }
       const note = args.trim();
-      const result = createResult(record, {
-        ...(currentLinkedRequestId ? { requestId: currentLinkedRequestId } : {}),
+      const resultInput: ResultInput = {
         source: "return-to-parent",
         status: lastStatus,
         response: latest,
-        ...(note ? { note } : {}),
-        ...(lastError ? { error: lastError } : {}),
-      });
-      writeResult(directory, result);
+      };
+      if (currentLinkedRequestId) resultInput.requestId = currentLinkedRequestId;
+      if (note) resultInput.note = note;
+      if (lastError) resultInput.error = lastError;
+      writeResult(directory, createResult(record, resultInput));
       terminalized = true;
       publishState(lastStatus, lastError);
       ctx.ui.notify("Returned the latest response to the parent.", "info");
@@ -295,10 +311,7 @@ function expirePendingInputs(
   }
 }
 
-function createResult(
-  record: RunRecord,
-  input: Omit<RunResult, "version" | "type" | "resultId" | "runId" | "capabilityToken" | "createdAt">,
-): RunResult {
+function createResult(record: RunRecord, input: ResultInput): RunResult {
   return {
     version: PROTOCOL_VERSION,
     type: "result",
@@ -310,11 +323,7 @@ function createResult(
   };
 }
 
-function assistantOutcome(messages: AgentMessage[]): {
-  response: string;
-  status: Extract<AgentStatus, "done" | "failed" | "interrupted">;
-  error?: string;
-} | undefined {
+function assistantOutcome(messages: AgentMessage[]): AssistantOutcome | undefined {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (!message || message.role !== "assistant") continue;
@@ -325,9 +334,12 @@ function assistantOutcome(messages: AgentMessage[]): {
       .trim();
     const stopReason = message.stopReason;
     const error = message.errorMessage;
-    if (stopReason === "aborted") return { response, status: "interrupted", ...(error ? { error } : {}) };
-    if (stopReason === "error") return { response, status: "failed", ...(error ? { error } : {}) };
-    return { response, status: "done", ...(error ? { error } : {}) };
+    const outcome: AssistantOutcome = {
+      response,
+      status: stopReason === "aborted" ? "interrupted" : stopReason === "error" ? "failed" : "done",
+    };
+    if (error) outcome.error = error;
+    return outcome;
   }
   return undefined;
 }
@@ -367,10 +379,10 @@ function writeLinkedTurn(directory: string, record: RunRecord, requestId: string
 
 function readLinkedTurn(directory: string, record: RunRecord): string | undefined {
   try {
-    const value = JSON.parse(fs.readFileSync(path.join(directory, TURN_FILE), "utf8")) as unknown;
-    if (!isRecord(value)) return undefined;
+    const value = jsonObject(parseJsonText(fs.readFileSync(path.join(directory, TURN_FILE), "utf8")));
+    if (!value) return undefined;
     if (value.runId !== record.runId || value.capabilityToken !== record.capabilityToken) return undefined;
-    return typeof value.requestId === "string" ? value.requestId : undefined;
+    return jsonString(value.requestId);
   } catch {
     return undefined;
   }
@@ -378,8 +390,4 @@ function readLinkedTurn(directory: string, record: RunRecord): string | undefine
 
 function clearLinkedTurn(directory: string): void {
   fs.rmSync(path.join(directory, TURN_FILE), { force: true });
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

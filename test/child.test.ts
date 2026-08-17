@@ -142,32 +142,40 @@ describe("child mailbox", () => {
   });
 });
 
-type Handler = (...args: unknown[]) => unknown;
+type Handler = (...args: unknown[]) => void;
 
-function fakePi(): {
+interface FakePi {
   pi: ExtensionAPI;
   sent: string[];
-  emit(name: string, ...args: unknown[]): unknown[];
-} {
+  emit(name: string, ...args: unknown[]): void;
+}
+
+function fakePi(): FakePi {
   const handlers = new Map<string, Handler[]>();
   const sent: string[] = [];
-  const pi = {
-    on(name: string, handler: Handler) {
-      const entries = handlers.get(name) ?? [];
-      entries.push(handler);
-      handlers.set(name, entries);
-    },
+  // SAFETY: ExtensionAPI.on is a set of per-event overloads. This double dispatches by
+  // event name alone, so it deliberately collapses that overload set into one signature.
+  const on = ((name: string, handler: Handler) => {
+    const entries = handlers.get(name) ?? [];
+    entries.push(handler);
+    handlers.set(name, entries);
+  }) as ExtensionAPI["on"];
+  const double: Partial<ExtensionAPI> = {
+    on,
     sendUserMessage(message: string) {
       sent.push(message);
     },
     registerCommand: vi.fn(),
-    events: { on: vi.fn() },
-  } as unknown as ExtensionAPI;
+    events: { emit: vi.fn(), on: vi.fn() },
+  };
+  // SAFETY: registerChildRuntime only touches on, sendUserMessage, registerCommand and
+  // events, all of which this double provides; the rest of ExtensionAPI is never reached.
+  const pi = double as ExtensionAPI;
   return {
     pi,
     sent,
     emit(name, ...args) {
-      return (handlers.get(name) ?? []).map((handler) => handler(...args));
+      for (const handler of handlers.get(name) ?? []) handler(...args);
     },
   };
 }

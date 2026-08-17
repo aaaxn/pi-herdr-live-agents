@@ -81,7 +81,7 @@ describe("HerdrClient", () => {
       throw new Error("process rejected");
     });
 
-    const error = await client.getPane("p1", abort.signal).catch((caught: unknown) => caught);
+    const error = await client.getPane("p1", abort.signal).catch((cause: unknown) => cause);
     expect(error).toMatchObject({ name: "HerdrCommandError", code: "aborted" });
   });
 
@@ -92,7 +92,7 @@ describe("HerdrClient", () => {
       stderr: "",
     }));
 
-    const error = await client.getPane("missing").catch((caught: unknown) => caught);
+    const error = await client.getPane("missing").catch((cause: unknown) => cause);
     expect(error).toBeInstanceOf(HerdrCommandError);
     expect(error).toMatchObject({ message: "Pane does not exist", code: "pane_not_found" });
   });

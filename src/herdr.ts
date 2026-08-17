@@ -1,3 +1,12 @@
+import {
+  jsonBoolean,
+  jsonNumber,
+  jsonObject,
+  jsonString,
+  parseJsonText,
+  type JsonObject,
+  type JsonValue,
+} from "./json.js";
 import type { HerdrAgent, HerdrPane, HerdrTab, PaneLayout } from "./types.js";
 
 export interface ExecResult {
@@ -13,12 +22,25 @@ export type ExecCommand = (
   options?: { signal?: AbortSignal; timeout?: number },
 ) => Promise<ExecResult>;
 
-interface HerdrEnvelope<T> {
-  result?: T;
-  error?: {
-    code?: string;
-    message?: string;
-  };
+interface HerdrErrorDetail {
+  message: string;
+  code?: string;
+}
+
+interface HerdrClientStatus {
+  protocol: number;
+}
+
+interface HerdrServerStatus {
+  status: string;
+  version: string;
+  protocol: number;
+  compatible?: boolean;
+}
+
+interface HerdrRuntimeStatus {
+  client: HerdrClientStatus;
+  server: HerdrServerStatus;
 }
 
 export class HerdrCommandError extends Error {
@@ -31,12 +53,12 @@ export class HerdrCommandError extends Error {
   }
 }
 
-export function isHerdrError(error: unknown, ...codes: string[]): error is HerdrCommandError {
-  return error instanceof HerdrCommandError && (codes.length === 0 || (error.code !== undefined && codes.includes(error.code)));
+export function isHerdrError(cause: unknown, ...codes: string[]): cause is HerdrCommandError {
+  return cause instanceof HerdrCommandError && (codes.length === 0 || (cause.code !== undefined && codes.includes(cause.code)));
 }
 
-export function isHerdrAbort(error: unknown): boolean {
-  return isHerdrError(error, "aborted");
+export function isHerdrAbort(cause: unknown): boolean {
+  return isHerdrError(cause, "aborted");
 }
 
 export class HerdrClient {
@@ -187,21 +209,30 @@ export class HerdrClient {
     await this.json(["agent", "send-keys", target, "esc"], signal);
   }
 
-  private async json<T = Record<string, unknown>>(args: string[], signal?: AbortSignal): Promise<T> {
+  private async json<T = JsonObject>(args: string[], signal?: AbortSignal): Promise<T> {
     const result = await this.run(args, signal);
     const text = result.stdout.trim();
     if (!text) throw new Error(`Herdr returned no JSON for: herdr ${args.join(" ")}`);
-    let envelope: HerdrEnvelope<T>;
+    let decoded: JsonValue;
     try {
-      envelope = JSON.parse(text) as HerdrEnvelope<T>;
+      decoded = parseJsonText(text);
     } catch {
       throw new Error(`Herdr returned invalid JSON for: herdr ${args.join(" ")}`);
     }
-    if (envelope.error) {
-      throw new HerdrCommandError(envelope.error.message || envelope.error.code || "Herdr request failed", envelope.error.code);
+    const envelope = jsonObject(decoded);
+    const failure = envelope?.["error"];
+    if (failure) {
+      const detail = jsonObject(failure);
+      const message = jsonString(detail?.["message"]);
+      const code = jsonString(detail?.["code"]);
+      throw new HerdrCommandError(message || code || "Herdr request failed", code);
     }
-    if (!envelope.result) throw new Error(`Herdr response has no result for: herdr ${args.join(" ")}`);
-    return envelope.result;
+    const payload = envelope?.["result"];
+    if (!payload) throw new Error(`Herdr response has no result for: herdr ${args.join(" ")}`);
+    // SAFETY: this method validates the envelope framing; the payload itself is the
+    // `herdr <args> --json` result documented for the argv each caller passes, and every
+    // call site names exactly that documented shape as T.
+    return payload as T;
   }
 
   private async run(args: string[], signal?: AbortSignal): Promise<ExecResult> {
@@ -236,54 +267,52 @@ function envArgs(env: Record<string, string>): string[] {
   return Object.entries(env).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
 }
 
-function parseRuntimeStatus(output: string): {
-  client: { protocol: number };
-  server: { status: string; version: string; protocol: number; compatible?: boolean };
-} {
-  let value: unknown;
+function parseRuntimeStatus(output: string): HerdrRuntimeStatus {
+  let decoded: JsonValue;
   try {
-    value = JSON.parse(output);
+    decoded = parseJsonText(output);
   } catch {
     throw new Error("Herdr status returned invalid JSON");
   }
-  if (!isRecord(value) || !isRecord(value.client) || !isRecord(value.server)) {
+  const root = jsonObject(decoded);
+  const client = jsonObject(root?.["client"]);
+  const server = jsonObject(root?.["server"]);
+  if (!client || !server) {
     throw new Error("Herdr status response is incomplete");
   }
+  const clientProtocol = jsonNumber(client["protocol"]);
+  const status = jsonString(server["status"]);
+  const version = jsonString(server["version"]);
+  const serverProtocol = jsonNumber(server["protocol"]);
+  const compatible = jsonBoolean(server["compatible"]);
   if (
-    typeof value.client.protocol !== "number" ||
-    typeof value.server.status !== "string" ||
-    typeof value.server.version !== "string" ||
-    typeof value.server.protocol !== "number" ||
-    (value.server.compatible !== undefined && typeof value.server.compatible !== "boolean")
+    clientProtocol === undefined ||
+    status === undefined ||
+    version === undefined ||
+    serverProtocol === undefined ||
+    (server["compatible"] !== undefined && compatible === undefined)
   ) {
     throw new Error("Herdr status response has invalid runtime fields");
   }
-  return {
-    client: { protocol: value.client.protocol },
-    server: {
-      status: value.server.status,
-      version: value.server.version,
-      protocol: value.server.protocol,
-      ...(value.server.compatible !== undefined ? { compatible: value.server.compatible } : {}),
-    },
-  };
+  const serverStatus: HerdrServerStatus = { status, version, protocol: serverProtocol };
+  if (compatible !== undefined) serverStatus.compatible = compatible;
+  return { client: { protocol: clientProtocol }, server: serverStatus };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function parseHerdrError(output: string): { message: string; code?: string } | undefined {
+function parseHerdrError(output: string): HerdrErrorDetail | undefined {
   const text = output.trim();
   if (!text) return undefined;
+  let decoded: JsonValue;
   try {
-    const envelope = JSON.parse(text) as HerdrEnvelope<unknown>;
-    if (!envelope.error) return { message: text };
-    return {
-      message: envelope.error.message || envelope.error.code || text,
-      ...(envelope.error.code ? { code: envelope.error.code } : {}),
-    };
+    decoded = parseJsonText(text);
   } catch {
     return { message: text };
   }
+  const error = jsonObject(jsonObject(decoded)?.["error"]);
+  if (!error) return { message: text };
+  const message = jsonString(error["message"]);
+  const code = jsonString(error["code"]);
+  const detail: HerdrErrorDetail = { message: message || code || text };
+  if (code) detail.code = code;
+  return detail;
 }

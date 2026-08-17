@@ -40,14 +40,6 @@ Try it without installing permanently:
 pi -e npm:@aaaxn/pi-herdr-subagents
 ```
 
-Other subagent extensions register the same tool names, and Pi refuses to load two extensions that claim one name. Remove the conflicting package first:
-
-```bash
-pi remove npm:@ogulcancelik/pi-codex-subagents
-```
-
-Restart or reload Pi afterwards. The old extension keeps its saved run data.
-
 ## How a delegation runs
 
 1. The parent model calls `spawn_agent` with a self-contained task message it wrote itself.
@@ -158,6 +150,10 @@ PI_HERDR_SMOKE=1 npx vitest run test/smoke.herdr.test.ts
 ```
 
 Set `PI_HERDR_SMOKE_PROVIDER` and `PI_HERDR_SMOKE_MODEL` to choose the child model.
+
+## Credits
+
+[Herdr](https://herdr.dev) is built by [Can Celik](https://github.com/ogulcancelik), and this extension exists because of it. Its [`@ogulcancelik/pi-herdr`](https://github.com/ogulcancelik/pi-extensions/tree/main/packages/pi-herdr) extension showed how Pi and Herdr fit together, and reading it shaped how this package talks to the Herdr CLI. Thank you.
 
 ## License
 

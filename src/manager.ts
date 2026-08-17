@@ -17,6 +17,7 @@ import {
   writeResult,
   writeRun,
 } from "./storage.js";
+import { errorMessage } from "./json.js";
 import { sliceUtf8 } from "./utf8.js";
 import {
   PROTOCOL_VERSION,
@@ -87,6 +88,35 @@ export interface SpawnReceipt {
   thinking?: ThinkingLevel;
 }
 
+export interface ResponseSlice {
+  agent_name: string;
+  result_id: string;
+  status: AgentStatus;
+  response: string;
+  offset: number;
+  total_bytes: number;
+  next_offset?: number;
+}
+
+interface SelectedProfile {
+  profile?: string;
+  model: ModelProfile;
+}
+
+/** The environment handed to a child Pi process. Declared as an alias so it stays
+ *  assignable to the Herdr client's `env` dictionary. */
+type ChildEnvironment = {
+  PI_HERDR_SUBAGENT: string;
+  PI_HERDR_SUBAGENT_RUN_ID: string;
+  PI_HERDR_SUBAGENT_RUN_DIR: string;
+  PI_HERDR_SUBAGENT_TOKEN: string;
+  PI_HERDR_SUBAGENT_PARENT_SESSION_ID: string;
+};
+
+type SplitPaneRequest = Parameters<HerdrClient["splitPane"]>[0];
+type CreateTabRequest = Parameters<HerdrClient["createTab"]>[0];
+type StartPiAgentRequest = Parameters<HerdrClient["startPiAgent"]>[0];
+
 type ManagedRun = {
   directory: string;
   record: RunRecord;
@@ -99,7 +129,7 @@ type PaneAllocation = {
   agentTabId?: string;
 };
 
-type MutableRunField =
+type ClearableRunField =
   | "paneId"
   | "tabId"
   | "workspaceId"
@@ -107,13 +137,31 @@ type MutableRunField =
   | "agentTabId"
   | "childSessionId"
   | "childSessionFile"
-  | "status"
   | "statusMessage"
   | "pendingRequestId"
   | "latestResultId"
   | "closedAt";
 
-type RunPatch = { [Key in MutableRunField]?: RunRecord[Key] | undefined };
+/**
+ * A patch over the mutable half of a RunRecord. `status` is required on the record,
+ * so it can only be replaced; every other mutable field is optional and setting it to
+ * `undefined` clears it.
+ */
+type RunPatch = { status?: AgentStatus } & { [Key in ClearableRunField]?: RunRecord[Key] | undefined };
+
+const CLEARABLE_RUN_FIELDS = [
+  "paneId",
+  "tabId",
+  "workspaceId",
+  "placement",
+  "agentTabId",
+  "childSessionId",
+  "childSessionFile",
+  "statusMessage",
+  "pendingRequestId",
+  "latestResultId",
+  "closedAt",
+] as const satisfies readonly ClearableRunField[];
 
 export class AgentManager {
   private readonly runs = new Map<string, ManagedRun>();
@@ -176,13 +224,10 @@ export class AgentManager {
         runId,
         taskName: input.taskName,
         parentSessionId: this.parent.sessionId,
-        ...(input.parentSessionFile ? { parentSessionFile: input.parentSessionFile } : {}),
         cwd: this.parent.cwd,
         capabilityToken,
-        ...(selected.profile ? { profile: selected.profile } : {}),
         provider: selected.model.provider,
         model: selected.model.model,
-        ...(selected.model.thinking ? { thinking: selected.model.thinking } : {}),
         herdrAgentName: agentRuntimeName(input.taskName, runId),
         status: "starting",
         deliveredResultIds: [],
@@ -190,6 +235,9 @@ export class AgentManager {
         createdAt: now,
         updatedAt: now,
       };
+      if (input.parentSessionFile) record.parentSessionFile = input.parentSessionFile;
+      if (selected.profile) record.profile = selected.profile;
+      if (selected.model.thinking) record.thinking = selected.model.thinking;
       const managed: ManagedRun = { directory, record, stateSeq: 0 };
       this.runs.set(runId, managed);
       this.activeReservations.add(runId);
@@ -210,7 +258,7 @@ export class AgentManager {
         });
       } catch (error) {
         this.activeReservations.delete(runId);
-        this.failRun(managed, `Unable to allocate a Herdr pane: ${errorText(error)}`);
+        this.failRun(managed, `Unable to allocate a Herdr pane: ${errorMessage(error)}`);
         throw error;
       }
       return { run: managed, initial: dispatch };
@@ -224,7 +272,7 @@ export class AgentManager {
         this.applyNativeStatus(run, started.agent_status);
       } catch (error) {
         const recovered = await this.recoverStartFailure(run);
-        if (!recovered) this.failRun(run, `Unable to start Pi in Herdr: ${errorText(error)}`);
+        if (!recovered) this.failRun(run, `Unable to start Pi in Herdr: ${errorMessage(error)}`);
         if (isHerdrAbort(error)) throw error;
       }
 
@@ -240,18 +288,19 @@ export class AgentManager {
     this.hooks.onChange();
 
     if (!run.record.paneId || !run.record.tabId) throw new Error(`Agent '${input.taskName}' has no Herdr pane`);
-    return {
+    const receipt: SpawnReceipt = {
       task_name: input.taskName,
       run_id: run.record.runId,
       pane_id: run.record.paneId,
       tab_id: run.record.tabId,
       agent_status: run.record.status,
       accepted: ack?.state === "delivered" || ack?.state === "queued",
-      ...(selected.profile ? { profile: selected.profile } : {}),
       provider: selected.model.provider,
       model: selected.model.model,
-      ...(selected.model.thinking ? { thinking: selected.model.thinking } : {}),
     };
+    if (selected.profile) receipt.profile = selected.profile;
+    if (selected.model.thinking) receipt.thinking = selected.model.thinking;
+    return receipt;
   }
 
   async sendMessage(target: string, message: string, signal?: AbortSignal): Promise<{ delivery: "steer" | "prompt" | "queued"; request_id: string }> {
@@ -263,10 +312,12 @@ export class AgentManager {
     const active = ACTIVE_STATUSES.has(run.record.status);
     const request = createDispatch(run.record, message, active ? "steer" : "auto");
     writeDispatch(run.directory, request);
-    this.updateRun(run, {
-      pendingRequestId: request.requestId,
-      ...(active ? {} : { status: "starting" as const, statusMessage: undefined }),
-    });
+    const patch: RunPatch = { pendingRequestId: request.requestId };
+    if (!active) {
+      patch.status = "starting";
+      patch.statusMessage = undefined;
+    }
+    this.updateRun(run, patch);
     const ack = await this.waitForAck(run, request.requestId, 6_000, signal);
     if (!ack) return { delivery: "queued", request_id: request.requestId };
     if (ack.state === "failed") throw new Error(ack.message);
@@ -323,11 +374,11 @@ export class AgentManager {
     for (const run of this.currentRuns()) {
       if (!MODEL_CLOSEABLE_STATUSES.has(run.record.status) || run.record.status === "closed") continue;
       try {
-        await this.close(run.record.runId, { force: false, ...(signal ? { signal } : {}) });
+        await this.close(run.record.runId, signal ? { force: false, signal } : { force: false });
         closed.push(run.record.taskName);
       } catch (error) {
         if (isHerdrAbort(error)) throw error;
-        skipped.push({ agent: run.record.taskName, reason: errorText(error) });
+        skipped.push({ agent: run.record.taskName, reason: errorMessage(error) });
       }
     }
     return { closed, skipped };
@@ -336,34 +387,29 @@ export class AgentManager {
   list(pathPrefix?: string): AgentSummary[] {
     return this.currentRuns()
       .filter((run) => !pathPrefix || run.record.taskName.startsWith(pathPrefix))
-      .map(({ record }) => ({
-        agent_name: record.taskName,
-        run_id: record.runId,
-        agent_status: record.status,
-        ...(record.statusMessage ? { status_message: record.statusMessage } : {}),
-        ...(record.paneId ? { pane_id: record.paneId } : {}),
-        ...(record.tabId ? { tab_id: record.tabId } : {}),
-        ...(record.profile ? { profile: record.profile } : {}),
-        provider: record.provider,
-        model: record.model,
-        ...(record.thinking ? { thinking: record.thinking } : {}),
-        created_at: record.createdAt,
-        updated_at: record.updatedAt,
-        ...(record.latestResultId ? { latest_result_id: record.latestResultId } : {}),
-        result_delivered: Boolean(record.latestResultId && record.deliveredResultIds.includes(record.latestResultId)),
-        awaiting_result: Boolean(record.pendingRequestId) || ACTIVE_STATUSES.has(record.status),
-      }));
+      .map(({ record }) => {
+        const summary: AgentSummary = {
+          agent_name: record.taskName,
+          run_id: record.runId,
+          agent_status: record.status,
+          provider: record.provider,
+          model: record.model,
+          created_at: record.createdAt,
+          updated_at: record.updatedAt,
+          result_delivered: Boolean(record.latestResultId && record.deliveredResultIds.includes(record.latestResultId)),
+          awaiting_result: Boolean(record.pendingRequestId) || ACTIVE_STATUSES.has(record.status),
+        };
+        if (record.statusMessage) summary.status_message = record.statusMessage;
+        if (record.paneId) summary.pane_id = record.paneId;
+        if (record.tabId) summary.tab_id = record.tabId;
+        if (record.profile) summary.profile = record.profile;
+        if (record.thinking) summary.thinking = record.thinking;
+        if (record.latestResultId) summary.latest_result_id = record.latestResultId;
+        return summary;
+      });
   }
 
-  readResponse(target: string, offset = 0, limit = 64 * 1024, resultId?: string): {
-    agent_name: string;
-    result_id: string;
-    status: AgentStatus;
-    response: string;
-    offset: number;
-    total_bytes: number;
-    next_offset?: number;
-  } {
+  readResponse(target: string, offset = 0, limit = 64 * 1024, resultId?: string): ResponseSlice {
     const run = this.requireRun(target);
     const selectedResultId = resultId ?? run.record.latestResultId;
     if (!selectedResultId) throw new Error(`Agent '${target}' has no final response`);
@@ -373,15 +419,16 @@ export class AgentManager {
       throw new Error("limit must be between 1 and 65536 bytes");
     }
     const content = sliceUtf8(result.response, offset, limit);
-    return {
+    const slice: ResponseSlice = {
       agent_name: run.record.taskName,
       result_id: result.resultId,
       status: result.status,
       response: content.text,
       offset,
       total_bytes: content.totalBytes,
-      ...(content.nextOffset !== undefined ? { next_offset: content.nextOffset } : {}),
     };
+    if (content.nextOffset !== undefined) slice.next_offset = content.nextOffset;
+    return slice;
   }
 
   latestResult(target: string): RunResult | undefined {
@@ -485,12 +532,13 @@ export class AgentManager {
       const key = resultKey(run.record.runId, result.resultId);
       if (this.seenResults.has(key)) continue;
       this.seenResults.add(key);
-      this.updateRun(run, {
+      const patch: RunPatch = {
         status: run.record.status === "closed" ? "closed" : result.status,
         statusMessage: result.error,
         latestResultId: result.resultId,
-        ...(result.requestId && result.requestId === run.record.pendingRequestId ? { pendingRequestId: undefined } : {}),
-      });
+      };
+      if (result.requestId && result.requestId === run.record.pendingRequestId) patch.pendingRequestId = undefined;
+      this.updateRun(run, patch);
       this.hooks.onResult(run.record, result);
     }
   }
@@ -533,13 +581,14 @@ export class AgentManager {
     const parentLayout = await this.herdr.getLayout(parentPane.pane_id, signal);
     const siblingPlan = parentLayout.zoomed ? undefined : planSiblingSplit(parentLayout, parentPane.pane_id, minimum);
     if (siblingPlan) {
-      const pane = await this.herdr.splitPane({
+      const request: SplitPaneRequest = {
         sourcePaneId: siblingPlan.sourcePaneId,
         direction: siblingPlan.direction,
         cwd: this.parent.cwd,
         env,
-        ...(signal ? { signal } : {}),
-      });
+      };
+      if (signal) request.signal = signal;
+      const pane = await this.herdr.splitPane(request);
       return { pane, placement: "sibling" };
     }
 
@@ -558,37 +607,39 @@ export class AgentManager {
       const layout = await this.herdr.getLayout(tabPanes[0].pane_id, signal);
       const plan = planLargestSplit(layout, new Set(tabPanes.map((pane) => pane.pane_id)), minimum);
       if (!plan) continue;
-      const pane = await this.herdr.splitPane({
+      const request: SplitPaneRequest = {
         sourcePaneId: plan.sourcePaneId,
         direction: plan.direction,
         cwd: this.parent.cwd,
         env,
-        ...(signal ? { signal } : {}),
-      });
+      };
+      if (signal) request.signal = signal;
+      const pane = await this.herdr.splitPane(request);
       return { pane, placement: "agents-tab", agentTabId: tab.tab_id };
     }
 
     const label = ownedTabIds.size === 0 ? tabLabel : `${tabLabel} · ${ownedTabIds.size + 1}`;
-    const created = await this.herdr.createTab({
+    const createTabRequest: CreateTabRequest = {
       workspaceId: parentPane.workspace_id,
       cwd: this.parent.cwd,
       label,
       env,
-      ...(signal ? { signal } : {}),
-    });
+    };
+    if (signal) createTabRequest.signal = signal;
+    const created = await this.herdr.createTab(createTabRequest);
     return { pane: created.pane, placement: "agents-tab", agentTabId: created.tab.tab_id };
   }
 
   private async startPi(run: ManagedRun, signal?: AbortSignal): Promise<HerdrAgent> {
-    const request = {
+    const request: StartPiAgentRequest = {
       name: run.record.herdrAgentName,
       paneId: requireValue(run.record.paneId, "pane id"),
       provider: run.record.provider,
       model: run.record.model,
-      ...(run.record.thinking ? { thinking: run.record.thinking } : {}),
       timeoutMs: 30_000,
-      ...(signal ? { signal } : {}),
     };
+    if (run.record.thinking) request.thinking = run.record.thinking;
+    if (signal) request.signal = signal;
     const deadline = Date.now() + PANE_READY_TIMEOUT_MS;
     while (true) {
       try {
@@ -684,25 +735,26 @@ export class AgentManager {
       createdAt: Date.now(),
     };
     writeResult(run.directory, result);
-    this.updateRun(run, {
+    const patch: RunPatch = {
       status: run.record.paneId ? "failed" : "closed",
       statusMessage: message,
       latestResultId: result.resultId,
-      ...(run.record.paneId ? {} : { closedAt: Date.now() }),
-    });
+    };
+    if (!run.record.paneId) patch.closedAt = Date.now();
+    this.updateRun(run, patch);
   }
 
   private updateRun(run: ManagedRun, patch: RunPatch): void {
-    for (const [key, value] of Object.entries(patch)) {
-      if (value === undefined) delete (run.record as unknown as Record<string, unknown>)[key];
-      else (run.record as unknown as Record<string, unknown>)[key] = value;
+    if (patch.status !== undefined) run.record.status = patch.status;
+    for (const field of CLEARABLE_RUN_FIELDS) {
+      if (field in patch) applyClearableField(run.record, patch, field);
     }
     run.record.updatedAt = Date.now();
     writeRun(run.directory, run.record);
     this.hooks.onChange();
   }
 
-  private selectProfile(requested: string | undefined, inherited: ModelProfile): { profile?: string; model: ModelProfile } {
+  private selectProfile(requested: string | undefined, inherited: ModelProfile): SelectedProfile {
     const name = requested ?? this.config.defaultProfile;
     if (!name) return { model: inherited };
     const profile = this.config.profiles[name];
@@ -801,7 +853,7 @@ function createDispatch(record: RunRecord, message: string, mode: "auto" | "stee
   };
 }
 
-function childEnvironment(run: ManagedRun): Record<string, string> {
+function childEnvironment(run: ManagedRun): ChildEnvironment {
   return {
     PI_HERDR_SUBAGENT: "1",
     PI_HERDR_SUBAGENT_RUN_ID: run.record.runId,
@@ -809,6 +861,17 @@ function childEnvironment(run: ManagedRun): Record<string, string> {
     PI_HERDR_SUBAGENT_TOKEN: run.record.capabilityToken,
     PI_HERDR_SUBAGENT_PARENT_SESSION_ID: run.record.parentSessionId,
   };
+}
+
+/** Apply one clearable patch field, preserving the delete-on-undefined semantics. */
+function applyClearableField<Key extends ClearableRunField>(
+  record: RunRecord,
+  patch: RunPatch,
+  field: Key,
+): void {
+  const value = patch[field];
+  if (value === undefined) delete record[field];
+  else record[field] = value;
 }
 
 function agentRuntimeName(taskName: string, runId: string): string {
@@ -835,10 +898,6 @@ function resultKey(runId: string, resultId: string): string {
 function requireValue<T>(value: T | undefined, label: string): T {
   if (value === undefined) throw new Error(`Missing ${label}`);
   return value;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function delay(ms: number): Promise<void> {

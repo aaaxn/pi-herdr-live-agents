@@ -100,6 +100,15 @@ describe("run mailbox storage", () => {
     expect(listSessionRuns("parent-1")).toEqual([]);
   });
 
+  it("rejects a stored run whose fields do not match the protocol", () => {
+    const record = runRecord();
+    const directory = createRunDirectory(record.parentSessionId, record.runId);
+    writeRun(directory, record);
+    fs.writeFileSync(path.join(directory, "run.json"), JSON.stringify({ ...record, deliveredResultIds: "none" }));
+
+    expect(listSessionRuns(record.parentSessionId)).toEqual([]);
+  });
+
   it("quarantines requests with the wrong capability token", () => {
     const record = runRecord();
     const directory = createRunDirectory(record.parentSessionId, record.runId);

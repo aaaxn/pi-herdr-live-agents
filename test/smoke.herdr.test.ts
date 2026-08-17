@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import { HerdrClient, type ExecResult } from "../src/herdr.js";
+import { isJsonNumber } from "../src/json.js";
 import { AgentManager } from "../src/manager.js";
 import type { RunResult } from "../src/types.js";
 
@@ -66,7 +67,7 @@ describe.runIf(enabled)("real Herdr subagent", () => {
       if (receipt) {
         await new HerdrClient(runHerdr)
           .closePane(receipt.pane_id)
-          .catch((error: unknown) => console.error("pane cleanup failed:", error));
+          .catch((cause: unknown) => console.error("pane cleanup failed:", cause));
       }
       manager.stop();
     }
@@ -76,8 +77,9 @@ describe.runIf(enabled)("real Herdr subagent", () => {
 function runHerdr(command: string, args: string[]): Promise<ExecResult> {
   return new Promise((resolve) => {
     execFile(command, args, { maxBuffer: 8 * 1024 * 1024 }, (error, stdout, stderr) => {
+      const exitCode = error?.code;
       resolve({
-        code: error && typeof (error as { code?: unknown }).code === "number" ? ((error as { code: number }).code) : error ? 1 : 0,
+        code: isJsonNumber(exitCode) ? exitCode : error ? 1 : 0,
         stdout,
         stderr,
       });
