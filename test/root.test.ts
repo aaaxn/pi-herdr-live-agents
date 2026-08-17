@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../src/config.js";
 import type { HerdrClient } from "../src/herdr.js";
 import { RootRuntime } from "../src/root.js";
-import { PROTOCOL_VERSION, type RunRecord, type RunResult } from "../src/types.js";
+import { PROTOCOL_VERSION, type AgentSummary, type RunRecord, type RunResult } from "../src/types.js";
 
 describe("RootRuntime waits", () => {
   it("does not mark partial wait-all results delivered before the whole wait resolves", async () => {
@@ -26,7 +26,7 @@ describe("RootRuntime waits", () => {
     const waiting = runtime.waitAll(["old", "new"]);
     expect(markDelivered).not.toHaveBeenCalled();
 
-    exposePrivate(runtime).handleResult(secondRun, secondResult);
+    runtime.handleResult(secondRun, secondResult);
     const responses = await waiting;
 
     expect(responses.map((entry) => entry.run_id)).toEqual([firstRun.runId, secondRun.runId]);
@@ -82,7 +82,7 @@ describe("RootRuntime waits", () => {
 
     const waiting = runtime.waitOne([run.runId]);
     const fresh = result(run, "result-new", "fresh response");
-    exposePrivate(runtime).handleResult(run, fresh);
+    runtime.handleResult(run, fresh);
 
     await expect(waiting).resolves.toMatchObject({ result_id: "result-new", response: "fresh response" });
     expect(latestResult).not.toHaveBeenCalled();
@@ -102,37 +102,39 @@ describe("RootRuntime waits", () => {
 
     const waiting = runtime.waitOne([run.runId]);
     run.status = "closed";
-    exposePrivate(runtime).handleManagerChange();
+    runtime.handleManagerChange();
 
     await expect(waiting).rejects.toThrow("closed without a result");
   });
 });
 
 function createRuntime(sendMessage = vi.fn()): RootRuntime {
-  const pi = {
+  const piDouble: Partial<ExtensionAPI> = {
     sendMessage,
     getThinkingLevel: () => "high",
-  } as unknown as ExtensionAPI;
-  const ctx = {
+  };
+  // SAFETY: RootRuntime reaches only sendMessage and getThinkingLevel on the parent API,
+  // and this double provides both; no other ExtensionAPI member is reachable in these tests.
+  const pi = piDouble as ExtensionAPI;
+  const sessionManagerDouble: Partial<ExtensionContext["sessionManager"]> = {
+    getSessionId: () => "parent-session",
+    getSessionFile: () => "/tmp/parent.jsonl",
+  };
+  const ctxDouble: Partial<ExtensionContext> = {
     cwd: "/repo",
     mode: "rpc",
     isIdle: () => true,
-    sessionManager: {
-      getSessionId: () => "parent-session",
-      getSessionFile: () => "/tmp/parent.jsonl",
-    },
-  } as unknown as ExtensionContext;
-  return new RootRuntime(pi, ctx, DEFAULT_CONFIG, {} as HerdrClient, "parent-pane");
-}
-
-function exposePrivate(runtime: RootRuntime): {
-  handleResult(run: RunRecord, result: RunResult): void;
-  handleManagerChange(): void;
-} {
-  return runtime as unknown as {
-    handleResult(run: RunRecord, result: RunResult): void;
-    handleManagerChange(): void;
+    // SAFETY: RootRuntime reads only getSessionId and getSessionFile off the parent session
+    // manager, both provided here; the remaining ReadonlySessionManager members stay unused.
+    sessionManager: sessionManagerDouble as ExtensionContext["sessionManager"],
   };
+  // SAFETY: RootRuntime's constructor and the waits exercised below touch only cwd, mode,
+  // isIdle and sessionManager, all provided above. Non-"tui" mode keeps ctx.ui unreachable.
+  const ctx = ctxDouble as ExtensionContext;
+  // SAFETY: AgentManager's constructor stores the Herdr client without calling it, and these
+  // tests never call manager.start(), so no method of this stand-in is ever invoked.
+  const herdr = {} as HerdrClient;
+  return new RootRuntime(pi, ctx, DEFAULT_CONFIG, herdr, "parent-pane");
 }
 
 function runRecord(
@@ -141,7 +143,7 @@ function runRecord(
   status: RunRecord["status"],
   latestResultId?: string,
 ): RunRecord {
-  return {
+  const record: RunRecord = {
     version: PROTOCOL_VERSION,
     runId,
     taskName,
@@ -152,15 +154,16 @@ function runRecord(
     model: "gpt-test",
     herdrAgentName: `sa-${runId}`,
     status,
-    ...(latestResultId ? { latestResultId } : {}),
     deliveredResultIds: [],
     createdAt: 1,
     updatedAt: 1,
   };
+  if (latestResultId) record.latestResultId = latestResultId;
+  return record;
 }
 
-function summary(run: RunRecord, awaiting: boolean) {
-  return {
+function summary(run: RunRecord, awaiting: boolean): AgentSummary {
+  const entry: AgentSummary = {
     agent_name: run.taskName,
     run_id: run.runId,
     agent_status: run.status,
@@ -168,10 +171,11 @@ function summary(run: RunRecord, awaiting: boolean) {
     model: run.model,
     created_at: run.createdAt,
     updated_at: run.updatedAt,
-    ...(run.latestResultId ? { latest_result_id: run.latestResultId } : {}),
     result_delivered: false,
     awaiting_result: awaiting,
   };
+  if (run.latestResultId) entry.latest_result_id = run.latestResultId;
+  return entry;
 }
 
 function result(run: RunRecord, resultId: string, response: string): RunResult {

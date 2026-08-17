@@ -1,9 +1,17 @@
-import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import type {
+  AgentToolUpdateCallback,
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  Theme,
+  ToolRenderResultOptions,
+} from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { loadConfig } from "./config.js";
 import { HerdrClient } from "./herdr.js";
-import { AgentManager, type SpawnReceipt } from "./manager.js";
+import { errorMessage } from "./json.js";
+import { AgentManager, type SpawnInput, type SpawnReceipt } from "./manager.js";
 import type { AgentStatus, AgentSummary, ExtensionConfig, ModelProfile, RunRecord, RunResult } from "./types.js";
 import { sliceUtf8 } from "./utf8.js";
 
@@ -17,12 +25,74 @@ const ACTIVE_STATUSES = new Set<AgentStatus>(["starting", "working", "blocked"])
 const FINAL_STATUSES = new Set<AgentStatus>(["done", "failed", "interrupted", "closed"]);
 
 type Completion = { run: RunRecord; result: RunResult };
-type WaitResult = ReturnType<typeof completionPayload>;
+
+/** One completion as the model sees it, from wait_agent or from automatic delivery. */
+interface CompletionPayload {
+  agent_name: string;
+  run_id: string;
+  result_id: string;
+  status: RunResult["status"];
+  response: string;
+  note?: string;
+  error?: string;
+  pane_id: string | undefined;
+  tab_id: string | undefined;
+  child_session_id: string | undefined;
+  child_session_file: string | undefined;
+}
+
+/** A completion delivered automatically, whose response is capped at AUTO_RESULT_LIMIT bytes. */
+interface BoundedCompletionPayload extends CompletionPayload {
+  truncated?: boolean;
+  response_bytes?: number;
+  next_offset?: number;
+  read_more?: string;
+}
+
+interface ResultMessageAgent {
+  name: string;
+  status: RunResult["status"];
+}
+
+/** The `details` this extension attaches to its own RESULT_MESSAGE_TYPE messages. */
+interface ResultMessageDetails {
+  agents: ResultMessageAgent[];
+}
+
+/** The `details` this extension attaches to its own STATUS_MESSAGE_TYPE messages. */
+interface StatusMessageDetails {
+  agent_name: string;
+  status: "blocked";
+}
+
+/** One text block returned to the model; the structural shape of the SDK's TextContent. */
+interface ToolText {
+  type: "text";
+  text: string;
+}
+
+/** The payload every tool in this extension returns. */
+interface ToolTextResult<TDetails> {
+  content: ToolText[];
+  details: TDetails;
+}
+
+/**
+ * What spawn_agent's result renderer reads back. The interactive transcript hands the
+ * renderer only content/details while the HTML exporter also stamps `isError`, so the
+ * flag is genuinely optional at this boundary.
+ */
+interface SpawnResultView {
+  isError?: boolean;
+  details?: SpawnReceipt | null;
+}
+
+type CloseOptions = Parameters<AgentManager["close"]>[1];
 
 type OneWaiter = {
   kind: "one";
   targets?: Set<string>;
-  resolve(value: WaitResult): void;
+  resolve(value: CompletionPayload): void;
   reject(error: Error): void;
   removeAbort?: () => void;
 };
@@ -31,7 +101,7 @@ type AllWaiter = {
   kind: "all";
   targets: Set<string>;
   results: Map<string, Completion>;
-  resolve(value: WaitResult[]): void;
+  resolve(value: CompletionPayload[]): void;
   reject(error: Error): void;
   removeAbort?: () => void;
 };
@@ -111,17 +181,18 @@ export class RootRuntime {
       throw new Error(`Model '${model.provider}/${model.model}' is not available in the parent Pi runtime`);
     }
     const parentSessionFile = ctx.sessionManager.getSessionFile();
-    return this.manager.spawn({
+    const input: SpawnInput = {
       taskName: params.task_name,
       message: params.message,
-      ...(params.profile ? { profile: params.profile } : {}),
       inherited: model,
-      ...(parentSessionFile ? { parentSessionFile } : {}),
-      ...(signal ? { signal } : {}),
-    });
+    };
+    if (params.profile) input.profile = params.profile;
+    if (parentSessionFile) input.parentSessionFile = parentSessionFile;
+    if (signal) input.signal = signal;
+    return this.manager.spawn(input);
   }
 
-  waitOne(targets: string[] | undefined, signal?: AbortSignal): Promise<WaitResult> {
+  waitOne(targets: string[] | undefined, signal?: AbortSignal): Promise<CompletionPayload> {
     if (signal?.aborted) return Promise.reject(new Error("Aborted"));
     const cleanTargets = targets?.map(cleanTarget).filter(Boolean);
     if (targets && cleanTargets?.length === 0) return Promise.reject(new Error("targets must not be empty"));
@@ -152,10 +223,10 @@ export class RootRuntime {
     return new Promise((resolve, reject) => {
       const waiter: OneWaiter = {
         kind: "one",
-        ...(targetIds ? { targets: targetIds } : {}),
         resolve,
         reject,
       };
+      if (targetIds) waiter.targets = targetIds;
       const removeAbort = bindAbort(signal, () => {
         this.waiters.delete(waiter);
         reject(new Error("Aborted"));
@@ -165,7 +236,7 @@ export class RootRuntime {
     });
   }
 
-  waitAll(targets: string[] | undefined, signal?: AbortSignal): Promise<WaitResult[]> {
+  waitAll(targets: string[] | undefined, signal?: AbortSignal): Promise<CompletionPayload[]> {
     if (signal?.aborted) return Promise.reject(new Error("Aborted"));
     const cleanTargets = targets?.map(cleanTarget).filter(Boolean);
     if (targets && cleanTargets?.length === 0) return Promise.reject(new Error("targets must not be empty"));
@@ -214,9 +285,12 @@ export class RootRuntime {
     });
   }
 
-  private handleManagerChange(): void {
+  /** Manager hook: run state changed. Also the entry point the root tests drive directly. */
+  handleManagerChange(): void {
     this.refreshWidget();
-    for (const waiter of [...this.waiters]) {
+    // Snapshot the waiters: rejecting one removes it from the set while this loop runs.
+    const waiters = [...this.waiters];
+    for (const waiter of waiters) {
       if (waiter.kind === "one" && !waiter.targets) continue;
       const targets = waiter.targets ?? new Set<string>();
       for (const runId of targets) {
@@ -263,7 +337,8 @@ export class RootRuntime {
     });
   }
 
-  private handleResult(run: RunRecord, result: RunResult): void {
+  /** Manager hook: a run produced a result. Also the entry point the root tests drive directly. */
+  handleResult(run: RunRecord, result: RunResult): void {
     if (this.offerToWaiters(run, result)) return;
     if (result.status !== "done" || result.source === "return-to-parent") {
       this.deliverCompletions([{ run, result }]);
@@ -295,7 +370,7 @@ export class RootRuntime {
   private deliverCompletions(completions: Completion[]): void {
     if (this.disposed) return;
     const payload = completions.map(({ run, result }) => boundedCompletionPayload(run, result));
-    this.pi.sendMessage(
+    this.pi.sendMessage<ResultMessageDetails>(
       {
         customType: RESULT_MESSAGE_TYPE,
         content: `<herdr_subagent_results>\n${JSON.stringify(payload, null, 2)}\n</herdr_subagent_results>`,
@@ -311,7 +386,7 @@ export class RootRuntime {
 
   private deliverBlocked(run: RunRecord): void {
     if (this.disposed) return;
-    this.pi.sendMessage(
+    this.pi.sendMessage<StatusMessageDetails>(
       {
         customType: STATUS_MESSAGE_TYPE,
         content: `<herdr_subagent_status>\n${JSON.stringify(
@@ -334,7 +409,9 @@ export class RootRuntime {
 
   private offerToWaiters(run: RunRecord, result: RunResult): boolean {
     let matched = false;
-    for (const waiter of [...this.waiters]) {
+    // Snapshot the waiters: resolving one removes it from the set while this loop runs.
+    const waiters = [...this.waiters];
+    for (const waiter of waiters) {
       if (waiter.kind === "one") {
         if (waiter.targets && !waiter.targets.has(run.runId)) continue;
         matched = true;
@@ -407,12 +484,18 @@ export function registerRootRuntime(pi: ExtensionAPI): void {
       message: Type.String({ description: "Complete task prompt written for the child Pi session." }),
       profile: Type.Optional(Type.String({ description: "Optional model profile containing only provider/model/thinking." })),
     }),
-    async execute(_id: string, params: { task_name: string; message: string; profile?: string }, signal: AbortSignal | undefined, _update: unknown, ctx: ExtensionContext) {
+    async execute(
+      _id: string,
+      params: { task_name: string; message: string; profile?: string },
+      signal: AbortSignal | undefined,
+      _update: AgentToolUpdateCallback<SpawnReceipt | null> | undefined,
+      ctx: ExtensionContext,
+    ) {
       try {
         const receipt = await requireRuntime().spawn(params, ctx, signal);
         return textResult(spawnReceiptText(receipt), receipt);
       } catch (error) {
-        throw new Error(`spawn_agent failed: ${errorText(error)}`);
+        throw new Error(`spawn_agent failed: ${errorMessage(error)}`);
       }
     },
     renderCall(args: { task_name?: string; profile?: string }, theme: Theme) {
@@ -424,26 +507,25 @@ export function registerRootRuntime(pi: ExtensionAPI): void {
         0,
       );
     },
-    renderResult(result: any, _options: unknown, theme: Theme) {
+    renderResult(result: SpawnResultView, _options: ToolRenderResultOptions, theme: Theme) {
       if (result.isError) return new Text(theme.fg("error", "✗ spawn failed"), 0, 0);
       const accepted = result.details?.accepted;
       return new Text(theme.fg(accepted ? "success" : "warning", `${accepted ? "✓" : "!"} ${result.details?.task_name ?? "agent"}`), 0, 0);
     },
   });
 
-  pi.registerMessageRenderer(RESULT_MESSAGE_TYPE, (message, { expanded }, theme) => {
-    const agents = isRecord(message.details) && Array.isArray(message.details.agents) ? message.details.agents : [];
-    const label = agents.length === 1 ? String(agents[0]?.name ?? "subagent") : `${agents.length} subagents`;
-    const failed = agents.some((entry: unknown) => isRecord(entry) && entry.status !== "done");
+  pi.registerMessageRenderer<ResultMessageDetails>(RESULT_MESSAGE_TYPE, (message, { expanded }, theme) => {
+    const agents = message.details?.agents ?? [];
+    const label = agents.length === 1 ? (agents[0]?.name ?? "subagent") : `${agents.length} subagents`;
+    const failed = agents.some((entry) => entry.status !== "done");
     let text = theme.fg(failed ? "warning" : "success", `${failed ? "!" : "✓"} ${label} returned`);
-    if (expanded && typeof message.content === "string") text += `\n${theme.fg("dim", message.content)}`;
+    if (expanded && !Array.isArray(message.content)) text += `\n${theme.fg("dim", message.content)}`;
     return new Text(text, 0, 0);
   });
 
-  pi.registerMessageRenderer(STATUS_MESSAGE_TYPE, (message, { expanded }, theme) => {
-    const details = isRecord(message.details) ? message.details : {};
-    let text = theme.fg("warning", `● ${String(details.agent_name ?? "subagent")} blocked`);
-    if (expanded && typeof message.content === "string") text += `\n${theme.fg("dim", message.content)}`;
+  pi.registerMessageRenderer<StatusMessageDetails>(STATUS_MESSAGE_TYPE, (message, { expanded }, theme) => {
+    let text = theme.fg("warning", `● ${message.details?.agent_name ?? "subagent"} blocked`);
+    if (expanded && !Array.isArray(message.content)) text += `\n${theme.fg("dim", message.content)}`;
     return new Text(text, 0, 0);
   });
 
@@ -471,7 +553,7 @@ export function registerRootRuntime(pi: ExtensionAPI): void {
     } catch (error) {
       active?.dispose();
       active = undefined;
-      startupError = errorText(error);
+      startupError = errorMessage(error);
       ctx.ui.notify(`pi-herdr-subagents: ${startupError}`, "error");
     }
   });
@@ -568,13 +650,15 @@ function registerManagementTools(pi: ExtensionAPI, runtime: () => RootRuntime): 
     description: "Close an idle or completed agent pane owned by this session. Refuses working or blocked agents; the model cannot force closure.",
     parameters: Type.Object({ target: Type.String() }),
     async execute(_id, params, signal) {
-      return textResult("Closed the visible agent pane.", await runtime().manager.close(params.target, { force: false, ...(signal ? { signal } : {}) }));
+      const options: CloseOptions = { force: false };
+      if (signal) options.signal = signal;
+      return textResult("Closed the visible agent pane.", await runtime().manager.close(params.target, options));
     },
   });
 }
 
 function registerCommands(pi: ExtensionAPI, runtime: () => RootRuntime): void {
-  const agentsHandler = async (args: string, ctx: any) => {
+  const agentsHandler = async (args: string, ctx: ExtensionCommandContext) => {
     const [action, target, flag] = args.trim().split(/\s+/).filter(Boolean);
     if (action === "close-done") {
       const { closed, skipped } = await runtime().manager.closeDone();
@@ -635,35 +719,33 @@ function registerCommands(pi: ExtensionAPI, runtime: () => RootRuntime): void {
   });
 }
 
-function completionPayload(run: RunRecord, result: RunResult) {
-  return {
+function completionPayload(run: RunRecord, result: RunResult): CompletionPayload {
+  const payload: CompletionPayload = {
     agent_name: run.taskName,
     run_id: run.runId,
     result_id: result.resultId,
     status: result.status,
     response: result.response,
-    ...(result.note ? { note: result.note } : {}),
-    ...(result.error ? { error: result.error } : {}),
     pane_id: run.paneId,
     tab_id: run.tabId,
     child_session_id: run.childSessionId,
     child_session_file: run.childSessionFile,
   };
+  if (result.note) payload.note = result.note;
+  if (result.error) payload.error = result.error;
+  return payload;
 }
 
-function boundedCompletionPayload(run: RunRecord, result: RunResult) {
+function boundedCompletionPayload(run: RunRecord, result: RunResult): BoundedCompletionPayload {
   const page = sliceUtf8(result.response, 0, AUTO_RESULT_LIMIT);
-  return {
-    ...completionPayload(run, { ...result, response: page.text }),
-    ...(page.nextOffset !== undefined
-      ? {
-          truncated: true,
-          response_bytes: page.totalBytes,
-          next_offset: page.nextOffset,
-          read_more: `read_agent_response({ target: ${JSON.stringify(run.runId)}, result_id: ${JSON.stringify(result.resultId)}, offset: ${page.nextOffset}, limit: ${AUTO_RESULT_LIMIT} })`,
-        }
-      : {}),
-  };
+  const payload: BoundedCompletionPayload = completionPayload(run, { ...result, response: page.text });
+  if (page.nextOffset !== undefined) {
+    payload.truncated = true;
+    payload.response_bytes = page.totalBytes;
+    payload.next_offset = page.nextOffset;
+    payload.read_more = `read_agent_response({ target: ${JSON.stringify(run.runId)}, result_id: ${JSON.stringify(result.resultId)}, offset: ${page.nextOffset}, limit: ${AUTO_RESULT_LIMIT} })`;
+  }
+  return payload;
 }
 
 function widgetText(agents: AgentSummary[], theme: Theme): string {
@@ -699,8 +781,8 @@ function spawnReceiptText(receipt: SpawnReceipt): string {
   return `Opened ${receipt.task_name} in visible pane ${receipt.pane_id}, but the task is still queued (${receipt.agent_status}). Inspect the pane if human input is required.`;
 }
 
-function textResult(text: string, details: unknown = null) {
-  return { content: [{ type: "text" as const, text }], details };
+function textResult<TDetails = null>(text: string, details: TDetails | null = null): ToolTextResult<TDetails | null> {
+  return { content: [{ type: "text", text }], details };
 }
 
 function bindAbort(signal: AbortSignal | undefined, callback: () => void): (() => void) | undefined {
@@ -719,12 +801,4 @@ function cleanTarget(target: string): string {
 
 function resultKey(completion: Completion): string {
   return `${completion.run.runId}:${completion.result.resultId}`;
-}
-
-function errorText(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-function isRecord(value: unknown): value is Record<string, any> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

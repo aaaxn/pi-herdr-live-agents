@@ -400,6 +400,14 @@ function runRecord(overrides: Partial<RunRecord>): RunRecord {
   };
 }
 
+interface StartPiAgentInput {
+  name: string;
+  paneId: string;
+  provider: string;
+  model: string;
+  thinking?: string;
+}
+
 class FakeHerdr implements HerdrPort {
   readonly splitCalls: Array<{
     sourcePaneId: string;
@@ -411,7 +419,7 @@ class FakeHerdr implements HerdrPort {
   readonly tabs: HerdrTab[] = [
     { tab_id: "t1", workspace_id: "w1", label: "1", focused: true, agent_status: "working" },
   ];
-  startedWith: Record<string, unknown> | undefined;
+  startedWith: StartPiAgentInput | undefined;
   parentWidth = 192;
   getPaneError: Error | undefined;
   closeError: Error | undefined;
@@ -568,13 +576,7 @@ class FakeHerdr implements HerdrPort {
     return this.agents;
   }
 
-  async startPiAgent(input: {
-    name: string;
-    paneId: string;
-    provider: string;
-    model: string;
-    thinking?: string;
-  }): Promise<HerdrAgent> {
+  async startPiAgent(input: StartPiAgentInput): Promise<HerdrAgent> {
     this.startAttempts += 1;
     if (this.startAttempts <= this.busyStarts) {
       throw new HerdrCommandError("agent target pane is not an available shell", "agent_pane_busy");
