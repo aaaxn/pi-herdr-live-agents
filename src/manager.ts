@@ -149,19 +149,6 @@ type ClearableRunField =
  */
 type RunPatch = { status?: AgentStatus } & { [Key in ClearableRunField]?: RunRecord[Key] | undefined };
 
-const CLEARABLE_RUN_FIELDS = [
-  "paneId",
-  "tabId",
-  "workspaceId",
-  "placement",
-  "agentTabId",
-  "childSessionId",
-  "childSessionFile",
-  "statusMessage",
-  "pendingRequestId",
-  "latestResultId",
-  "closedAt",
-] as const satisfies readonly ClearableRunField[];
 
 export class AgentManager {
   private readonly runs = new Map<string, ManagedRun>();
@@ -745,11 +732,20 @@ export class AgentManager {
   }
 
   private updateRun(run: ManagedRun, patch: RunPatch): void {
-    if (patch.status !== undefined) run.record.status = patch.status;
-    for (const field of CLEARABLE_RUN_FIELDS) {
-      if (field in patch) applyClearableField(run.record, patch, field);
-    }
-    run.record.updatedAt = Date.now();
+    const record = run.record;
+    if (patch.status !== undefined) record.status = patch.status;
+    if ("paneId" in patch) setOrClear(record, "paneId", patch.paneId);
+    if ("tabId" in patch) setOrClear(record, "tabId", patch.tabId);
+    if ("workspaceId" in patch) setOrClear(record, "workspaceId", patch.workspaceId);
+    if ("placement" in patch) setOrClear(record, "placement", patch.placement);
+    if ("agentTabId" in patch) setOrClear(record, "agentTabId", patch.agentTabId);
+    if ("childSessionId" in patch) setOrClear(record, "childSessionId", patch.childSessionId);
+    if ("childSessionFile" in patch) setOrClear(record, "childSessionFile", patch.childSessionFile);
+    if ("statusMessage" in patch) setOrClear(record, "statusMessage", patch.statusMessage);
+    if ("pendingRequestId" in patch) setOrClear(record, "pendingRequestId", patch.pendingRequestId);
+    if ("latestResultId" in patch) setOrClear(record, "latestResultId", patch.latestResultId);
+    if ("closedAt" in patch) setOrClear(record, "closedAt", patch.closedAt);
+    record.updatedAt = Date.now();
     writeRun(run.directory, run.record);
     this.hooks.onChange();
   }
@@ -863,13 +859,8 @@ function childEnvironment(run: ManagedRun): ChildEnvironment {
   };
 }
 
-/** Apply one clearable patch field, preserving the delete-on-undefined semantics. */
-function applyClearableField<Key extends ClearableRunField>(
-  record: RunRecord,
-  patch: RunPatch,
-  field: Key,
-): void {
-  const value = patch[field];
+/** Write one optional run field, deleting it when the patch clears it with `undefined`. */
+function setOrClear<Key extends ClearableRunField>(record: RunRecord, field: Key, value: RunRecord[Key]): void {
   if (value === undefined) delete record[field];
   else record[field] = value;
 }

@@ -9,15 +9,16 @@
 Every subagent is a normal Pi TUI in its own pane. You can watch it work, read its whole conversation, scroll its history, type into it, and keep it open after the delegated task finishes. The parent session still orchestrates the work through tools, so the model delegates exactly as it would with a headless extension.
 
 ```text
-┌───────────────────────────┬───────────────────────────┐
-│ parent Pi session         │ agent: review-auth        │
-│                           │                           │
-│ > spawn_agent(...)        │ > Review the auth module  │
-│   started review-auth     │   reading src/auth.ts     │
-│ > wait_agent(...)         │   ...                     │
-│                           │                           │
-│ agents  1 running         │ claude-opus-5 > high      │
-└───────────────────────────┴───────────────────────────┘
+┌─────────────────────────────────┬─────────────────────────────────┐
+│ parent Pi session               │ agent · review-auth             │
+│                                 │                                 │
+│ > spawn_agent(review-auth)      │ > Review src/auth.ts and report │
+│   pane w2:p4 · claude-fable-5   │   every token-expiry bug.       │
+│ > wait_agent(review-auth)       │   read src/auth.ts              │
+│   waiting...                    │   ...                           │
+│                                 │                                 │
+│ agents  1 running               │ ~/app > claude-fable-5 > high   │
+└─────────────────────────────────┴─────────────────────────────────┘
 ```
 
 ## Requirements
@@ -105,7 +106,7 @@ Configure them globally in `~/.pi/agent/pi-herdr-subagents.json`, or per project
   "profiles": {
     "general": { "provider": "openai-codex", "model": "gpt-5.6-sol", "thinking": "high" },
     "explore": { "provider": "openai-codex", "model": "gpt-5.6-luna", "thinking": "xhigh" },
-    "review": { "provider": "anthropic", "model": "claude-opus-5", "thinking": "xhigh" }
+    "review": { "provider": "anthropic", "model": "claude-fable-5", "thinking": "high" }
   },
   "layout": { "minPaneWidth": 72, "minPaneHeight": 20 },
   "limits": { "maxConcurrentAgents": 4, "maxOpenPanes": 8 },
