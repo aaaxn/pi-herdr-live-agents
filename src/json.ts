@@ -43,7 +43,6 @@ export function isJsonArray(value: JsonValue | undefined): value is readonly Jso
   return Array.isArray(value);
 }
 
-/** Read a string, or `undefined` when the value is absent or another JSON type. */
 export function jsonString(value: JsonValue | undefined): string | undefined {
   return isJsonString(value) ? value : undefined;
 }
@@ -53,17 +52,14 @@ export function jsonNumber(value: JsonValue | undefined): number | undefined {
   return isJsonNumber(value) ? value : undefined;
 }
 
-/** Read a boolean, or `undefined` when the value is absent or another JSON type. */
 export function jsonBoolean(value: JsonValue | undefined): boolean | undefined {
   return isJsonBoolean(value) ? value : undefined;
 }
 
-/** Read a nested object, or `undefined` when the value is absent or another JSON type. */
 export function jsonObject(value: JsonValue | undefined): JsonObject | undefined {
   return isJsonObject(value) ? value : undefined;
 }
 
-/** Read an array, or `undefined` when the value is absent or another JSON type. */
 export function jsonArray(value: JsonValue | undefined): readonly JsonValue[] | undefined {
   return isJsonArray(value) ? value : undefined;
 }

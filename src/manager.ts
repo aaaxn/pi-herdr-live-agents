@@ -859,7 +859,6 @@ function childEnvironment(run: ManagedRun): ChildEnvironment {
   };
 }
 
-/** Write one optional run field, deleting it when the patch clears it with `undefined`. */
 function setOrClear<Key extends ClearableRunField>(record: RunRecord, field: Key, value: RunRecord[Key]): void {
   if (value === undefined) delete record[field];
   else record[field] = value;

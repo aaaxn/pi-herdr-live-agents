@@ -269,7 +269,6 @@ function quarantine(filePath: string): void {
   }
 }
 
-/** Read a stored document, or `undefined` when it is missing, unreadable, or not a JSON object. */
 function readJsonObject(filePath: string): JsonObject | undefined {
   try {
     return jsonObject(parseJsonText(fs.readFileSync(filePath, "utf8")));
