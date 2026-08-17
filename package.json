@@ -1,6 +1,6 @@
 {
   "name": "pi-herdr-live-agents",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Visible Pi (sub)agents that run as real, live Pi sessions in Herdr panes.",
   "type": "module",
   "keywords": [
